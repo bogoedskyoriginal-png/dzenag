@@ -1,94 +1,34 @@
-from __future__ import annotations
-
-import subprocess
-import sys
+﻿from __future__ import annotations
 
 import streamlit as st
 
-from dzen_agent.ai import ArticleGenerator
-from dzen_agent.config import PROJECT_ROOT, get_settings
-from dzen_agent.database import ArticleRepository
-
-
-settings = get_settings()
-repository = ArticleRepository(settings.database_path)
-repository.initialize()
+from dzen_agent.config import get_settings
+from dzen_agent.prompt_service import Prompts
+from dzen_agent.store import Store
+from dzen_agent.ui_pages import PAGES, handle_error
 
 st.set_page_config(page_title="Dzen Agent", page_icon="✍️", layout="wide")
 st.title("Dzen Agent")
-st.caption("Создание и подготовка статей. Финальная публикация всегда остаётся за вами.")
+st.caption("Контент, исследования и подготовка публикаций · время по Москве")
 
-if "draft" not in st.session_state:
-    st.session_state.draft = None
-
-with st.container(border=True):
-    st.subheader("Новая статья")
-    topic = st.text_input("Тема статьи", placeholder="Например: как выбрать кофемолку для дома")
-    if st.button("Создать статью", type="primary"):
-        if not settings.openai_api_key:
-            st.error("Не найден OPENAI_API_KEY. Скопируйте .env.example в .env и добавьте ключ.")
-        elif not topic.strip():
-            st.warning("Введите тему статьи.")
-        else:
-            try:
-                with st.spinner("Готовлю черновик…"):
-                    generated = ArticleGenerator(
-                        settings.openai_api_key, settings.openai_model
-                    ).generate(topic)
-                st.session_state.draft = {
-                    "topic": topic.strip(),
-                    "title": generated.title,
-                    "body": generated.body,
-                }
-            except Exception as error:
-                st.error(f"Не удалось создать статью: {error}")
-
-draft = st.session_state.draft
-if draft:
-    with st.form("new_article"):
-        title = st.text_input("Заголовок", value=draft["title"])
-        body = st.text_area("Текст статьи", value=draft["body"], height=420)
-        if st.form_submit_button("Сохранить статью"):
-            if title.strip() and body.strip():
-                article = repository.create(draft["topic"], title, body)
-                st.session_state.draft = None
-                st.success(f"Статья №{article.id} сохранена.")
-                st.rerun()
-            else:
-                st.warning("Заголовок и текст не должны быть пустыми.")
-
-st.divider()
-st.subheader("Сохранённые статьи")
-articles = repository.list_all()
-if not articles:
-    st.info("Здесь появятся сохранённые статьи.")
-
-for article in articles:
-    with st.expander(f"#{article.id} · {article.title} · {article.status.value}"):
-        with st.form(f"article-{article.id}"):
-            edited_title = st.text_input("Заголовок", value=article.title, key=f"title-{article.id}")
-            edited_body = st.text_area(
-                "Текст", value=article.body, height=320, key=f"body-{article.id}"
-            )
-            save, prepare = st.columns(2)
-            save_clicked = save.form_submit_button("Сохранить изменения")
-            prepare_clicked = prepare.form_submit_button("Подготовить в Дзене")
-
-        if save_clicked or prepare_clicked:
-            repository.update_content(article.id, edited_title, edited_body)
-        if save_clicked:
-            st.success("Изменения сохранены.")
+try:
+    config = get_settings()
+    store = Store(config.database_path)
+    store.initialize()
+    Prompts(store).seed()
+    settings = store.settings()
+    with st.sidebar:
+        section = st.radio("Раздел", list(PAGES))
+        st.caption(f"Режим: {settings['mode']}")
+        if st.button("🛑 Остановить автопилот", type="primary", use_container_width=True):
+            store.set_setting("stop_requested", True)
+            store.set_setting("scheduler_enabled", False)
+            store.set_setting("mode", "REVIEW")
             st.rerun()
-        if prepare_clicked:
-            try:
-                subprocess.Popen(
-                    [sys.executable, "-m", "dzen_agent.browser.worker", str(article.id)],
-                    cwd=str(PROJECT_ROOT),
-                )
-                st.info(
-                    "Открываю отдельное окно браузера. При первом запуске войдите в Дзен вручную. "
-                    "После заполнения проверьте черновик — приложение ничего не публикует."
-                )
-            except OSError as error:
-                st.error(f"Не удалось запустить браузер: {error}")
-
+        if settings["stop_requested"]:
+            st.warning("Агент остановлен. Готовые результаты сохранены.")
+        if not config.aitunnel_api_key:
+            st.info("Ключ AITUNNEL не добавлен в .env. AI-операции пока недоступны.")
+    PAGES[section](store, config)
+except Exception as error:
+    handle_error(error)
