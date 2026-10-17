@@ -8,6 +8,7 @@ from PIL import Image
 from dzen_agent.pipeline.orchestrator import Pipeline, approve_week, create_run
 from dzen_agent.prompt_service import Prompts
 from dzen_agent.provider import AITunnel
+from dzen_agent.plan_review import approve_plan
 from dzen_agent.statistics import import_csv, preview_csv
 from dzen_agent.store import Store
 
@@ -65,6 +66,10 @@ def test_full_pipeline_resume_keeps_paid_text_and_images(tmp_path):
     api = AITunnel(store, "key", httpx.Client(transport=httpx.MockTransport(handler)))
     pipeline = Pipeline(store, api)
     run_id = create_run(store, "2030-01-07")
+    assert pipeline.execute(run_id) == "AWAITING_PLAN_REVIEW"
+    assert len(store.list_all()) == 0
+    assert counts["writer"] == 0
+    approve_plan(store, store.one("SELECT id FROM content_plans WHERE run_id=?", (run_id,))["id"])
     assert pipeline.execute(run_id) == "NEEDS_ACTION"
     assert len(store.list_all()) == 2
     assert pipeline.execute(run_id) == "AWAITING_REVIEW"

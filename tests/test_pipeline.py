@@ -2,6 +2,7 @@ from datetime import datetime
 
 from dzen_agent.pipeline.orchestrator import Pipeline, create_run
 from dzen_agent.prompt_service import Prompts
+from dzen_agent.plan_review import approve_plan
 from dzen_agent.scheduler import next_run
 from dzen_agent.store import MSK, Store
 
@@ -19,11 +20,8 @@ def test_missing_statistics_records_failure_and_can_resume(tmp_path):
     assert "CSV" in stage["error"]
 
 
-def test_completed_stages_not_repeated_after_failure(tmp_path):
-    store = Store(tmp_path / "test.db")
-    store.initialize()
-    Prompts(store).seed()
-    run_id = create_run(store, "2030-01-07")
+def test_completed_stages_not_repeated_after_failure(editorial_plan):
+    store, run_id, plan_id, _ = editorial_plan
     calls = []
 
     class ControlledPipeline(Pipeline):
@@ -33,6 +31,8 @@ def test_completed_stages_not_repeated_after_failure(tmp_path):
                 raise ValueError("temporary failure after writing")
 
     pipeline = ControlledPipeline(store, None)
+    assert pipeline.execute(run_id) == "AWAITING_PLAN_REVIEW"
+    approve_plan(store, plan_id)
     assert pipeline.execute(run_id) == "NEEDS_ACTION"
     assert pipeline.execute(run_id) == "AWAITING_REVIEW"
     assert calls.count("WRITE") == 1

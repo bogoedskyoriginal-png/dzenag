@@ -6,12 +6,13 @@ from datetime import datetime, timedelta
 from dzen_agent.errors import UserActionRequired, log_exception, redact
 from dzen_agent.locking import exclusive_lock
 from dzen_agent.models import ArticleStatus
+from dzen_agent.plan_review import is_approved
 from dzen_agent.prompt_service import Prompts
 from dzen_agent.schemas import ContentQA
 from dzen_agent.services import ContentService, qa_article, similar, week_slots
 from dzen_agent.store import MSK, Store, dumps, now_iso
 
-STAGES = ("COLLECT_STATS", "ANALYZE", "RESEARCH", "PLAN", "WRITE", "IMAGE", "QA",
+STAGES = ("COLLECT_STATS", "ANALYZE", "RESEARCH", "PLAN", "PLAN_REVIEW", "REFRESH_RESEARCH", "WRITE", "IMAGE", "QA",
           "REVIEW", "DZEN_SCHEDULE", "VERIFY")
 
 
@@ -85,12 +86,21 @@ class Pipeline:
                 self._check_stop()
                 record = self.store.one("SELECT * FROM pipeline_stages WHERE run_id=? AND stage=?",
                                         (run_id, stage))
+                if stage == "PLAN_REVIEW":
+                    plan = self.store.one("SELECT * FROM content_plans WHERE run_id=?", (run_id,))
+                    if not plan:
+                        raise UserActionRequired("Контент-план ещё не сохранён. Завершите этап PLAN.")
+                    if self.store.settings()["mode"] != "AUTOPILOT" and not is_approved(plan):
+                        return self._wait(run_id, stage, "AWAITING_PLAN_REVIEW",
+                                          "Контент-план готов. Проверьте идеи перед созданием статей.")
                 if record["status"] == "SUCCEEDED":
                     continue
                 self.store.execute("UPDATE pipeline_stages SET status='RUNNING',started_at=?,"
                                    "ended_at=NULL,error=NULL,attempts=attempts+1 WHERE id=?",
                                    (now_iso(), record["id"]))
-                if stage == "REVIEW":
+                if stage == "PLAN_REVIEW":
+                    pass  # Explicitly approved above, or skipped in AUTOPILOT; no paid operation.
+                elif stage == "REVIEW":
                     current_mode = self.store.settings()["mode"]
                     fresh = self.store.one("SELECT approved_at FROM pipeline_runs WHERE id=?", (run_id,))
                     if current_mode != "AUTOPILOT" and not fresh["approved_at"]:
@@ -137,8 +147,8 @@ class Pipeline:
             return status
 
     def _wait(self, run_id, stage, status, message):
-        self.store.execute("UPDATE pipeline_stages SET status='WAITING',error=? WHERE run_id=? "
-                           "AND stage=?", (message, run_id, stage))
+        self.store.execute("UPDATE pipeline_stages SET status='WAITING',error=?,started_at=COALESCE(started_at,?),"
+                           "ended_at=NULL WHERE run_id=? AND stage=?", (message, now_iso(), run_id, stage))
         self.store.execute("UPDATE pipeline_runs SET status=?,error=NULL WHERE id=?", (status, run_id))
         return status
 
@@ -181,6 +191,26 @@ class Pipeline:
             rows = self.store.rows("SELECT * FROM research_jobs WHERE run_id=? AND status='sufficient'",
                                     (run_id,))
             service.plan(analytics, rows, run["week_start"], key + ":plan")
+        elif stage == "REFRESH_RESEARCH":
+            concepts = self.store.rows("SELECT c.* FROM concepts c JOIN content_plans p ON p.id=c.plan_id "
+                                       "WHERE p.run_id=? AND c.needs_research=1 ORDER BY c.id", (run_id,))
+            for concept in concepts:
+                self._check_stop()
+                payload = json.loads(concept["payload_json"])
+                query = concept["topic"] + "\nРедакционный ракурс: " + payload["angle"]
+                research_id = service.research(
+                    query, analytics, key + f":refresh:{concept['id']}:v{concept['research_version']}",
+                    cache_topic=f"{concept['topic']} [груминг {concept['id']} v{concept['research_version']}]",
+                )
+                research = self.store.one("SELECT * FROM research_jobs WHERE id=?", (research_id,))
+                if not research or research["status"] != "sufficient":
+                    raise UserActionRequired("Новое исследование не подтвердило изменённую тему.")
+                payload["research_job_id"] = research_id
+                payload["research_source_ids"] = [s["id"] for s in json.loads(research["payload_json"])["sources"]]
+                with self.store._connect() as conn:
+                    conn.execute("UPDATE concepts SET research_id=?,payload_json=?,needs_research=0,"
+                                 "status='PLANNED' WHERE id=? AND research_version=?",
+                                 (research_id, dumps(payload), concept["id"], concept["research_version"]))
         elif stage == "WRITE":
             concepts = self.store.rows("SELECT c.* FROM concepts c JOIN content_plans p ON p.id=c.plan_id "
                                        "WHERE p.run_id=? ORDER BY c.id", (run_id,))

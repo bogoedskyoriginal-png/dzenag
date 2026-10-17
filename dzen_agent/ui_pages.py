@@ -12,7 +12,8 @@ from dzen_agent.browser.scheduling import DzenScheduling, UNVERIFIED
 from dzen_agent.browser.session import launch_session
 from dzen_agent.browser.statistics_download import STATUS as CSV_DOWNLOAD_STATUS
 from dzen_agent.errors import UserActionRequired, log_exception, redact
-from dzen_agent.pipeline.orchestrator import approve_week, create_run, estimate_operations
+from dzen_agent.pipeline.orchestrator import STAGES, approve_week, create_run, estimate_operations
+from dzen_agent.plan_review import approve_plan, editing_reason, is_approved
 from dzen_agent.prompt_service import PROMPT_TYPES, VARIABLES, Prompts
 from dzen_agent.provider import AITunnel, choose_defaults, fetch_catalog
 from dzen_agent.recovery import authorize_retry, refresh_pending_config
@@ -22,7 +23,7 @@ from dzen_agent.store import MSK, dumps, now_iso
 
 DAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 PROMPT_NAMES = {"ANALYTICS": "Analytics", "RESEARCH": "Research", "PLANNER": "Content Planner",
-                "WRITER": "Writer", "IMAGE": "Image"}
+                "WRITER": "Writer", "IMAGE": "Image", "EDITOR": "Editorial Chat / Груминг"}
 
 
 def rub(value):
@@ -90,8 +91,11 @@ def show_run(store, run):
     st.write(f"**Запуск №{run['id']} · неделя {run['week_start']} · {run['status']}**")
     if run.get("error"):
         st.warning(run["error"])
-    st.dataframe(store.rows("SELECT stage,status,started_at,ended_at,error,attempts "
-                            "FROM pipeline_stages WHERE run_id=? ORDER BY id", (run["id"],)),
+    if run["status"] == "AWAITING_PLAN_REVIEW":
+        st.info("Контент-план готов. Откройте «Контент-план», проверьте идеи и утвердите их перед созданием статей.")
+    stages = store.rows("SELECT stage,status,started_at,ended_at,error,attempts "
+                       "FROM pipeline_stages WHERE run_id=?", (run["id"],))
+    st.dataframe(sorted(stages, key=lambda row: STAGES.index(row["stage"]) if row["stage"] in STAGES else 99),
                  hide_index=True, use_container_width=True)
     st.write("Стоимость запуска:", rub(store.costs(run_id=run["id"])["total"]))
 
@@ -168,6 +172,8 @@ def statistics_page(store, config):
 
 
 def content_plan(store, config):
+    from dzen_agent.editorial_ui import grooming_panel
+
     st.subheader("Недельный контент-план")
     plans = store.rows("SELECT * FROM content_plans ORDER BY id DESC")
     if not plans:
@@ -175,15 +181,51 @@ def content_plan(store, config):
         return
     plan_id = st.selectbox("Неделя", [p["id"] for p in plans], format_func=lambda value:
                            next(p["week_start"] for p in plans if p["id"] == value))
-    for row in store.rows("SELECT * FROM concepts WHERE plan_id=? ORDER BY scheduled_at", (plan_id,)):
-        concept = json.loads(row["payload_json"])
-        with st.expander(f"{row['scheduled_at']} · {concept['working_title']}"):
-            st.json(concept)
-            st.write("Статус:", row["status"])
     run_id = next(p["run_id"] for p in plans if p["id"] == plan_id)
-    if st.button("Утвердить неделю", type="primary"):
-        action("Проверяю и утверждаю…", lambda: approve_week(store, run_id))
-    st.caption("Отправка утверждённой недели — в разделе «Автопилот».")
+    plan = next(p for p in plans if p["id"] == plan_id)
+    left, right = st.columns([3, 2], gap="large")
+    with left:
+        reason = editing_reason(store, plan_id)
+        if reason:
+            st.info(reason)
+        elif is_approved(plan):
+            st.success("Контент-план утверждён. Можно продолжать подготовку статей.")
+        else:
+            st.info("Контент-план готов. Проверьте идеи перед созданием статей.")
+        for number, row in enumerate(store.rows(
+                "SELECT * FROM concepts WHERE plan_id=? ORDER BY scheduled_at,id", (plan_id,)), 1):
+            concept = json.loads(row["payload_json"])
+            when = datetime.fromisoformat(row["scheduled_at"]).astimezone(MSK).strftime("%d.%m · %H:%M")
+            with st.container(border=True):
+                st.markdown(f"**{number}. {concept['working_title']}**")
+                st.caption(f"{when} (Москва) · концепт №{row['id']} · версия {row['revision']}")
+                st.write("Тема:", row["topic"])
+                st.write("Ракурс:", concept["angle"])
+                if row["needs_research"]:
+                    st.warning("Для изменённой темы потребуется новое исследование.")
+                with st.expander("Подробнее об идее"):
+                    for field, label in [("why_now", "Почему сейчас"), ("audience_value", "Польза читателю"),
+                                         ("thesis", "Главный тезис")]:
+                        st.write(label + ":", concept[field])
+                    for point in concept["key_points"]:
+                        st.write("• " + point)
+                    st.caption(f"Оценка: {concept['score']}")
+        if st.button("Утвердить контент-план и продолжить", type="primary",
+                     disabled=store.settings()["stop_requested"] or (is_approved(plan) and bool(reason))):
+            def approve_and_continue():
+                approve_plan(store, plan_id)
+                scheduler.launch_pipeline(run_id)
+                return True
+            if action("Утверждаю контент-план…", approve_and_continue):
+                st.success("Контент-план утверждён. Продолжаю подготовку статей.")
+        st.caption("После создания статей и QA потребуется отдельное утверждение готовой недели.")
+        qa = store.one("SELECT status FROM pipeline_stages WHERE run_id=? AND stage='QA'", (run_id,))
+        if qa and qa["status"] == "SUCCEEDED":
+            if st.button("Утвердить неделю"):
+                action("Проверяю готовые материалы…", lambda: approve_week(store, run_id))
+            st.caption("Отправка утверждённой недели — в разделе «Автопилот».")
+    with right:
+        grooming_panel(store, config, plan_id)
 
 
 def articles_page(store, config):

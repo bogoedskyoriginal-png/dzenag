@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS articles (
  id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, title TEXT NOT NULL,
@@ -101,6 +101,34 @@ CREATE TABLE event_log (
 );
 """
 
+EDITORIAL_SCHEMA = """
+ALTER TABLE content_plans ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE content_plans ADD COLUMN approved_revision INTEGER;
+ALTER TABLE content_plans ADD COLUMN approved_at TEXT;
+ALTER TABLE concepts ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE concepts ADD COLUMN needs_research INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE concepts ADD COLUMN research_version INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE editorial_chat_messages (
+ id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES content_plans(id),
+ role TEXT NOT NULL CHECK(role IN ('user','assistant')), content TEXT NOT NULL,
+ suggestions_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+ reply_to INTEGER UNIQUE REFERENCES editorial_chat_messages(id),
+ status TEXT NOT NULL DEFAULT 'COMPLETE', error TEXT, request_json TEXT
+);
+CREATE INDEX editorial_chat_plan ON editorial_chat_messages(plan_id,id);
+INSERT INTO pipeline_stages(run_id,stage,status)
+ SELECT id,'PLAN_REVIEW','PENDING' FROM pipeline_runs;
+INSERT INTO pipeline_stages(run_id,stage,status)
+ SELECT id,'REFRESH_RESEARCH','PENDING' FROM pipeline_runs;
+UPDATE content_plans SET approved_revision=revision,approved_at=created_at
+ WHERE EXISTS (SELECT 1 FROM article_details a WHERE a.run_id=content_plans.run_id)
+ OR EXISTS (SELECT 1 FROM pipeline_stages s WHERE s.run_id=content_plans.run_id
+            AND s.stage='WRITE' AND s.status='SUCCEEDED');
+UPDATE pipeline_stages SET status='SUCCEEDED'
+ WHERE stage IN ('PLAN_REVIEW','REFRESH_RESEARCH')
+ AND run_id IN (SELECT run_id FROM content_plans WHERE approved_revision IS NOT NULL);
+"""
+
 
 def migrate(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,11 +148,13 @@ def migrate(path: Path) -> None:
         conn.execute("BEGIN IMMEDIATE")
         try:
             # Another process may have migrated while we acquired the write lock.
-            if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
-                for statement in SCHEMA.split(";"):
-                    if statement.strip():
-                        conn.execute(statement)
-                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            current = conn.execute("PRAGMA user_version").fetchone()[0]
+            for target, script in ((1, SCHEMA), (2, EDITORIAL_SCHEMA)):
+                if current < target:
+                    for statement in script.split(";"):
+                        if statement.strip():
+                            conn.execute(statement)
+                    conn.execute(f"PRAGMA user_version={target}")
             conn.commit()
         except Exception:
             conn.rollback()

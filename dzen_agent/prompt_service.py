@@ -5,11 +5,12 @@ from pathlib import Path
 
 from dzen_agent.store import Store, dumps, now_iso
 
-PROMPT_TYPES = ("ANALYTICS", "RESEARCH", "PLANNER", "WRITER", "IMAGE")
+PROMPT_TYPES = ("ANALYTICS", "RESEARCH", "PLANNER", "WRITER", "IMAGE", "EDITOR")
 VARIABLES = {
     "statistics", "previous_statistics", "analytics", "research", "topic", "concept",
     "article_title", "article_body", "article_summary", "sources", "publication_date",
     "history", "used_topics", "article_count", "schedule", "channel_topic", "today",
+    "plan", "week", "editorial_constraints",
 }
 VARIABLE = re.compile(r"{{\s*([a-z_][a-z_0-9]*)\s*}}")
 

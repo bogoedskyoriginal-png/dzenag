@@ -145,9 +145,11 @@ class ContentService:
             "VALUES(?,?,?,?,?)", (statistics_id, self.run_id, result.model_dump_json(),
                                   self.prompts["ANALYTICS"]["id"], now_iso()))
 
-    def research(self, topic: str, analytics: dict, call_key: str) -> int:
+    def research(self, topic: str, analytics: dict, call_key: str, *, cache_topic: str | None = None) -> int:
+        # Editorial revisions need their own durable identity even when only the angle changed.
+        cache_topic = cache_topic or topic
         existing = self.store.one("SELECT * FROM research_jobs WHERE run_id=? AND topic=?",
-                                  (self.run_id, topic)) if self.run_id else None
+                                  (self.run_id, cache_topic)) if self.run_id else None
         if existing and existing["status"] == "sufficient":
             return existing["id"]
         research = None
@@ -169,7 +171,7 @@ class ContentService:
             else:
                 research_id = conn.execute(
                     "INSERT INTO research_jobs(run_id,topic,status,payload_json,created_at) "
-                    "VALUES(?,?,?,?,?)", (self.run_id, topic, research.status,
+                    "VALUES(?,?,?,?,?)", (self.run_id, cache_topic, research.status,
                                           research.model_dump_json(), now_iso()),
                 ).lastrowid
             for source in research.sources:
@@ -222,6 +224,8 @@ class ContentService:
 
     def write(self, topic: str, research_id: int, call_key: str, *, concept_row=None,
               article_id=None, part="all") -> int:
+        if concept_row and concept_row.get("needs_research"):
+            raise UserActionRequired("Для изменённой темы сначала требуется свежее исследование.")
         if concept_row and not article_id:
             existing = self.store.one("SELECT article_id FROM article_details WHERE concept_id=?",
                                       (concept_row["id"],))
@@ -376,7 +380,8 @@ def qa_article(store: Store, article_id: int) -> dict:
         stages = store.rows("SELECT stage,status FROM pipeline_stages WHERE run_id=?",
                             (detail["run_id"],))
         done = {s["stage"] for s in stages if s["status"] == "SUCCEEDED"}
-        missing = {"COLLECT_STATS", "ANALYZE", "RESEARCH", "PLAN", "WRITE", "IMAGE"} - done
+        missing = {"COLLECT_STATS", "ANALYZE", "RESEARCH", "PLAN", "PLAN_REVIEW", "REFRESH_RESEARCH",
+                   "WRITE", "IMAGE"} - done
         if missing:
             issues.append("Не завершены этапы: " + ", ".join(sorted(missing)))
     result = {"passed": not issues, "issues": issues, "checked_at": now_iso(),
