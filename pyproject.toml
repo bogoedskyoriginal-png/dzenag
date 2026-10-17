@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dzen-agent"
+version = "0.1.0"
+description = "Local assistant for preparing Yandex Dzen article drafts"
+requires-python = ">=3.11"
+dependencies = [
+  "streamlit==1.51.0",
+  "openai==2.6.1",
+  "playwright==1.55.0",
+  "python-dotenv==1.1.1",
+  "pydantic==2.12.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2", "ruff==0.14.1"]
+
+[tool.setuptools.packages.find]
+include = ["dzen_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+

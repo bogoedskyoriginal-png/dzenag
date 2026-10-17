@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.streamlit/
+data/*.db*
+browser-profile/
+.playwright/
+playwright-report/
+test-results/
+
