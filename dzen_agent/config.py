@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -25,6 +25,7 @@ class Settings:
     dzen_editor_url: str
     dzen_headless: bool
     dzen_browser_executable: str | None
+    aitunnel_api_key: str | None = None
 
 
 def get_settings() -> Settings:
@@ -40,5 +41,7 @@ def get_settings() -> Settings:
         dzen_editor_url=os.getenv("DZEN_EDITOR_URL", "https://dzen.ru/profile/editor/id/new"),
         dzen_headless=_as_bool(os.getenv("DZEN_HEADLESS", "false")),
         dzen_browser_executable=os.getenv("DZEN_BROWSER_EXECUTABLE"),
+        # Deliberately read only .env, never a database or inherited environment key.
+        aitunnel_api_key=dotenv_values(PROJECT_ROOT / ".env").get("AITUNNEL_API_KEY") or None,
     )
 

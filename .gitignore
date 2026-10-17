@@ -11,4 +11,9 @@ browser-profile/
 .playwright/
 playwright-report/
 test-results/
+data/
+logs/
+screenshots/
+*.sqlite*
+*.db*
 

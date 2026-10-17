@@ -16,8 +16,9 @@ class ArticleRepository:
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
         try:
             yield connection
             connection.commit()
@@ -25,6 +26,9 @@ class ArticleRepository:
             connection.close()
 
     def initialize(self) -> None:
+        from dzen_agent.migrations import migrate
+
+        migrate(self.database_path)
         with self._connect() as connection:
             connection.execute(
                 """
@@ -73,6 +77,21 @@ class ArticleRepository:
     def update_content(self, article_id: int, title: str, body: str) -> Article:
         now = datetime.now(UTC).isoformat()
         with self._connect() as connection:
+            old = connection.execute(
+                "SELECT title, body FROM articles WHERE id=?", (article_id,)
+            ).fetchone()
+            if old and (old["title"] != title.strip() or old["body"] != body.strip()):
+                connection.execute(
+                    "INSERT INTO article_revisions(article_id,title,body,created_at) VALUES(?,?,?,?)",
+                    (article_id, old["title"], old["body"], now),
+                )
+                connection.execute(
+                    "UPDATE article_details SET qa_json=NULL WHERE article_id=?", (article_id,)
+                )
+                connection.execute(
+                    "UPDATE articles SET status='WRITTEN' WHERE id=? "
+                    "AND status IN ('APPROVED','READY_FOR_REVIEW')", (article_id,)
+                )
             cursor = connection.execute(
                 "UPDATE articles SET title = ?, body = ?, updated_at = ? WHERE id = ?",
                 (title.strip(), body.strip(), now, article_id),

@@ -3,4 +3,7 @@ openai==2.6.1
 playwright==1.55.0
 python-dotenv==1.1.1
 pydantic==2.12.3
+httpx==0.28.1
+Pillow>=10,<13
+tzdata>=2025.2
 
