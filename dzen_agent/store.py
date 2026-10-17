@@ -29,6 +29,7 @@ DEFAULTS = {
     "analytics_model": "", "research_model": "", "planner_model": "",
     "writer_model": "", "image_model": "", "dzen_statistics_url": "",
     "image_quality": "low", "dzen_adapter_verified": False,
+    "dzen_editor_url": "",
 }
 
 

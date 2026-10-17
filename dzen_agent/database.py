@@ -92,6 +92,7 @@ class ArticleRepository:
                     "UPDATE articles SET status='WRITTEN' WHERE id=? "
                     "AND status IN ('APPROVED','READY_FOR_REVIEW')", (article_id,)
                 )
+                _invalidate_run(connection, article_id)
             cursor = connection.execute(
                 "UPDATE articles SET title = ?, body = ?, updated_at = ? WHERE id = ?",
                 (title.strip(), body.strip(), now, article_id),
@@ -122,4 +123,15 @@ def _to_article(row: sqlite3.Row) -> Article:
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )
+
+
+def _invalidate_run(connection: sqlite3.Connection, article_id: int) -> None:
+    """Any material edit revokes approval; it never silently schedules edited content."""
+    detail = connection.execute("SELECT run_id FROM article_details WHERE article_id=?",
+                                (article_id,)).fetchone()
+    if detail and detail["run_id"]:
+        connection.execute("UPDATE pipeline_runs SET approved_at=NULL,status='AWAITING_REVIEW' "
+                           "WHERE id=?", (detail["run_id"],))
+        connection.execute("UPDATE pipeline_stages SET status='PENDING' WHERE run_id=? "
+                           "AND stage IN ('QA','REVIEW')", (detail["run_id"],))
 

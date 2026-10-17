@@ -73,3 +73,13 @@ class WrittenArticle(Output):
 class ContentQA(Output):
     passed: bool
     issues: list[str]
+
+
+class NewTitle(Output):
+    title: str = Field(min_length=1)
+
+
+class NewBody(Output):
+    body: str = Field(min_length=1)
+    short_summary: str = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)

@@ -11,10 +11,11 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from dzen_agent.errors import UserActionRequired
+from dzen_agent.database import _invalidate_run
 from dzen_agent.models import ArticleStatus
 from dzen_agent.prompt_service import Prompts, render
 from dzen_agent.provider import AITunnel, save_image_bytes
-from dzen_agent.schemas import Analytics, Plan, Research, WrittenArticle
+from dzen_agent.schemas import Analytics, NewBody, NewTitle, Plan, Research, WrittenArticle
 from dzen_agent.statistics import statistics_context
 from dzen_agent.store import MSK, Store, dumps, now_iso
 
@@ -95,6 +96,12 @@ class ContentService:
             raise UserActionRequired("Выберите модели в разделе «Настройки / Модели».")
         prompt = self.prompts[kind]
         system = render(prompt["content"], context)
+        system += ("\n\nТехнический контракт приложения: итоговый ответ — только JSON по схеме ниже. "
+                   "Этот контракт заменяет прежние требования к форме JSON, сохраняя редакционные "
+                   "инструкции. Используй только переданные или найденные источники.\n"
+                   + dumps(schema.model_json_schema()))
+        if schema.__name__ == "ContentQA":
+            system += "\nЗадача этого вызова — проверить готовую статью по исследованию, а не написать новую."
         payload = {
             "messages": [
                 {"role": "system", "content": system},
@@ -226,12 +233,23 @@ class ContentService:
         research = json.loads(row["payload_json"])
         concept = json.loads(concept_row["payload_json"]) if concept_row else {"topic": topic}
         existing_article = self.store.get(article_id) if article_id else None
-        result, _ = self.structured("WRITER", WrittenArticle, self.context(
+        output_schema = NewTitle if part == "title" else NewBody if part == "body" else WrittenArticle
+        result, _ = self.structured("WRITER", output_schema, self.context(
             topic=topic, concept=concept, research=research, sources=research["sources"],
             article_title=existing_article.title if existing_article else "",
             article_body=existing_article.body if existing_article else "",
             publication_date=concept_row["scheduled_at"] if concept_row else "",
         ), call_key, article_id=article_id)
+        if existing_article and part != "all":
+            existing_detail = self.store.detail(article_id)
+            result = WrittenArticle.model_validate({
+                "title": existing_article.title,
+                "body": existing_article.body,
+                "short_summary": existing_detail.get("short_summary") or existing_article.body[:400],
+                "source_ids": json.loads(existing_detail.get("source_ids_json") or "[]")
+                or [s["id"] for s in research["sources"]],
+                **result.model_dump(),
+            })
         if not result.title.strip() or not result.body.strip():
             raise UserActionRequired("Модель вернула пустой материал.")
         ids = {s["id"] for s in research["sources"]}
@@ -312,6 +330,7 @@ class ContentService:
                                     (article_id, path, model, prompt_version, cost, origin,
                                      now_iso())).lastrowid
             conn.execute("UPDATE article_details SET qa_json=NULL WHERE article_id=?", (article_id,))
+            _invalidate_run(conn, article_id)
             conn.execute("UPDATE articles SET status='IMAGE_READY' WHERE id=? AND status NOT IN "
                          "('SCHEDULED','SCHEDULED_VERIFIED','PUBLISHED')", (article_id,))
         return image_id
