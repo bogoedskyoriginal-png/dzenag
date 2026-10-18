@@ -1,9 +1,15 @@
 import json
+from pathlib import Path
 
 import pytest
 
 from dzen_agent.pipeline.orchestrator import create_run
 from dzen_agent.store import Store, dumps, now_iso
+
+
+@pytest.fixture
+def analytics_v1():
+    return json.loads((Path(__file__).parent / "fixtures" / "analytics_v1.json").read_text("utf-8"))
 
 
 @pytest.fixture
@@ -13,6 +19,7 @@ def plan_factory(tmp_path):
     for role in ("analytics", "research", "planner", "writer", "image"):
         store.set_setting(role + "_model", role + "-test")
     store.set_setting("max_articles_per_week", 2)
+    store.set_setting("pipeline_flow", "legacy")  # Fixture represents an existing pre-Discovery run.
 
     def create(week="2030-01-07"):
         run_id = create_run(store, week)

@@ -27,6 +27,7 @@ DEFAULTS = {
     "channel_topic": "", "ai_qa_enabled": False, "max_output_tokens": 8000,
     "statistics_max_age_days": 14, "research_use_web_tool": False,
     "analytics_model": "", "research_model": "", "planner_model": "",
+    "discovery_model": "",
     "writer_model": "", "image_model": "", "dzen_statistics_url": "",
     "image_quality": "low", "dzen_adapter_verified": False,
     "dzen_editor_url": "",

@@ -12,18 +12,20 @@ from dzen_agent.browser.scheduling import DzenScheduling, UNVERIFIED
 from dzen_agent.browser.session import launch_session
 from dzen_agent.browser.statistics_download import STATUS as CSV_DOWNLOAD_STATUS
 from dzen_agent.errors import UserActionRequired, log_exception, redact
-from dzen_agent.pipeline.orchestrator import STAGES, approve_week, create_run, estimate_operations
+from dzen_agent.pipeline.orchestrator import approve_week, create_run, estimate_operations, stages_for
+from dzen_agent.analytics_contract import analytics_summary, briefs, parse_analytics
+from dzen_agent.analytics_input import validate_metadata
 from dzen_agent.plan_review import approve_plan, editing_reason, is_approved
 from dzen_agent.prompt_service import PROMPT_TYPES, VARIABLES, Prompts
 from dzen_agent.provider import AITunnel, choose_defaults, fetch_catalog
-from dzen_agent.recovery import authorize_retry, refresh_pending_config
+from dzen_agent.recovery import authorize_retry, refresh_pending_config, restart_analytics
 from dzen_agent.services import ContentService, qa_article
 from dzen_agent.statistics import ALIASES, import_csv, preview_csv
 from dzen_agent.store import MSK, dumps, now_iso
 
 DAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 PROMPT_NAMES = {"ANALYTICS": "Analytics", "RESEARCH": "Research", "PLANNER": "Content Planner",
-                "WRITER": "Writer", "IMAGE": "Image", "EDITOR": "Editorial Chat / Груминг"}
+                "WRITER": "Writer", "IMAGE": "Image", "EDITOR": "Editorial Chat / Груминг", "DISCOVERY": "Discovery"}
 
 
 def rub(value):
@@ -56,6 +58,35 @@ def provider(store, config):
 
 def service(store, config):
     return ContentService(store, provider(store, config))
+
+
+def show_analytics(payload):
+    result = parse_analytics(payload)
+    discovery, planner = briefs(payload)
+    st.write(analytics_summary(payload))
+    if payload.get("contract_version") == "1.0":
+        st.caption(f"Analytics 1.0 · {result.status} · публикаций: {result.data_quality.articles_total} "
+                   f"· пригодных: {result.data_quality.articles_usable}")
+        for issue in result.data_quality.issues + result.data_quality.comparison_limitations:
+            st.warning(issue)
+        for observation in result.observations:
+            st.write(f"**{observation.id}.** {observation.finding}")
+        for request in result.missing_data_requests:
+            st.info(request)
+    else:
+        st.caption("Архивный формат Analytics; исходный результат сохранён.")
+    for heading, brief in (("Задание Discovery", discovery), ("Редакционные указания Planner", planner)):
+        st.markdown("**" + heading + "**")
+        for key, value in brief.items():
+            if value:
+                st.caption(key.replace("_", " "))
+                if isinstance(value, list):
+                    for item in value:
+                        st.write("• " + item)
+                else:
+                    st.write(value)
+    with st.expander("Полный результат / диагностика"):
+        st.json(payload)
 
 
 def show_account(store, config):
@@ -95,7 +126,8 @@ def show_run(store, run):
         st.info("Контент-план готов. Откройте «Контент-план», проверьте идеи и утвердите их перед созданием статей.")
     stages = store.rows("SELECT stage,status,started_at,ended_at,error,attempts "
                        "FROM pipeline_stages WHERE run_id=?", (run["id"],))
-    st.dataframe(sorted(stages, key=lambda row: STAGES.index(row["stage"]) if row["stage"] in STAGES else 99),
+    order = stages_for(json.loads(run["settings_json"]))
+    st.dataframe(sorted(stages, key=lambda row: order.index(row["stage"]) if row["stage"] in order else 99),
                  hide_index=True, use_container_width=True)
     st.write("Стоимость запуска:", rub(store.costs(run_id=run["id"])["total"]))
 
@@ -165,7 +197,30 @@ def statistics_page(store, config):
             action("Анализирую…", lambda: service(store, config).analyze(selected, "analytics:" + uuid4().hex))
     for row in store.rows("SELECT * FROM analytics_results ORDER BY id DESC LIMIT 10"):
         with st.expander(f"Анализ №{row['id']} · {row['created_at']}"):
-            st.json(json.loads(row["payload_json"]))
+            show_analytics(json.loads(row["payload_json"]))
+    if imports:
+        with st.expander("Период измерения выбранного импорта"):
+            st.caption("Укажите только известные значения. Дата загрузки файла не считается датой формирования выгрузки.")
+            current = store.one("SELECT metadata_json FROM statistics_imports WHERE id=?", (selected,))
+            metadata = json.loads(current["metadata_json"])
+            windows = ["unknown", "lifetime", "calendar_period", "first_24h", "first_72h", "first_7d"]
+            names = ["Неизвестен", "Накопительные показатели", "Календарный период", "Первые 24 часа", "Первые 72 часа", "Первые 7 дней"]
+            window = st.selectbox("Окно измерения", windows, index=windows.index(metadata.get("measurement_window", "unknown")),
+                                 format_func=lambda value: names[windows.index(value)])
+            period = metadata.get("period", {})
+            start = st.date_input("Начало периода, если известно", value=datetime.fromisoformat(period["start"]).date() if period.get("start") else None)
+            end = st.date_input("Конец периода, если известно", value=datetime.fromisoformat(period["end"]).date() if period.get("end") else None)
+            as_of = st.date_input("Дата формирования выгрузки, если известна", value=datetime.fromisoformat(period["as_of"]).date() if period.get("as_of") else None)
+            attribution = st.checkbox("Подписки в CSV достоверно относятся к отдельным статьям", value=metadata.get("subscription_attribution_confirmed", False))
+            if st.button("Сохранить сведения о периоде"):
+                def save_metadata():
+                    value = validate_metadata({**metadata, "measurement_window": window,
+                        "subscription_attribution_confirmed": attribution,
+                        "period": {"start": start.isoformat() if start else None, "end": end.isoformat() if end else None,
+                                   "as_of": as_of.isoformat() if as_of else None, "timezone": "Europe/Moscow"}})
+                    store.execute("UPDATE statistics_imports SET metadata_json=? WHERE id=?", (dumps(value), selected))
+                    return True
+                action("Сохраняю сведения…", save_metadata)
     st.caption("Автоматическая загрузка: " + CSV_DOWNLOAD_STATUS)
     if st.button("Открыть Дзен для входа / диагностики", key="stats-login"):
         action("Открываю браузер…", launch_session)
@@ -202,7 +257,9 @@ def content_plan(store, config):
                 st.write("Тема:", row["topic"])
                 st.write("Ракурс:", concept["angle"])
                 if row["needs_research"]:
-                    st.warning("Для изменённой темы потребуется новое исследование.")
+                    job = store.one("SELECT status FROM research_jobs WHERE id=?", (row["research_id"],))
+                    st.warning("Исследование будет выполнено после утверждения контент-плана." if job and job["status"] == "pending"
+                               else "Для изменённой темы потребуется новое исследование.")
                 with st.expander("Подробнее об идее"):
                     for field, label in [("why_now", "Почему сейчас"), ("audience_value", "Польза читателю"),
                                          ("thesis", "Главный тезис")]:
@@ -353,12 +410,17 @@ def invalidate_approval(store, article_id):
 
 def prompts_page(store, config):
     st.subheader("Промпты и история версий")
-    st.caption("Четыре авторских промпта пока не переданы. Стартовые шаблоны помечены; "
-               "Writer использует прежние инструкции V0. Ваш текст сохраняется дословно.")
+    st.caption("Пользовательские версии сохраняются дословно. Промпт новой роли добавляется "
+               "только после вашего сохранения; существующие версии остаются в истории.")
     kind = st.radio("Назначение", PROMPT_TYPES, format_func=lambda x: PROMPT_NAMES[x], horizontal=True)
     prompts = Prompts(store)
     active = prompts.active(kind)
-    st.write(f"Активная версия: **{active['version']}** · {active['created_at']}")
+    if not active:
+        st.warning("Промпт ещё не задан. Вставьте согласованный текст и сохраните первую активную версию. "
+                   "Приложение не заменяет его промптом другой роли.")
+        active = {"id": 0, "title": PROMPT_NAMES[kind], "content": "", "version": 0, "created_at": ""}
+    else:
+        st.write(f"Активная версия: **{active['version']}** · {active['created_at']}")
     with st.form(f"prompt-{kind}-{active['id']}"):
         title = st.text_input("Название", value=active["title"])
         content = st.text_area("Текст промпта", value=active["content"], height=400)
@@ -367,6 +429,8 @@ def prompts_page(store, config):
                 st.rerun()
     st.caption("Переменные: " + ", ".join("{{" + v + "}}" for v in sorted(VARIABLES)))
     history = store.rows("SELECT * FROM prompt_versions WHERE prompt_type=? ORDER BY version DESC", (kind,))
+    if not history:
+        return
     version_id = st.selectbox("Открыть версию из истории", [p["id"] for p in history],
                               format_func=lambda value: next(f"v{p['version']} · {p['created_at']}"
                                                               for p in history if p["id"] == value))
@@ -397,10 +461,10 @@ def models_page(store, config):
         st.caption("Каталог обновлён: " + settings.get("catalog_updated_at", "неизвестно"))
     with st.form("model_settings"):
         selected = {}
-        for role in ("analytics", "research", "planner", "writer", "image"):
+        for role in ("analytics", "discovery", "research", "planner", "writer", "image"):
             group = "images" if role == "image" else "chat"
             options = list(catalog.get(group, {}))
-            current = settings[role + "_model"]
+            current = settings[role + "_model"] or (settings["research_model"] if role == "discovery" else "")
             if current and current not in options:
                 options.insert(0, current)
             if options:
@@ -514,6 +578,10 @@ def autopilot_page(store, config):
                        "к незавершённым этапам. Неопределённый запрос повторяется только после вашей проверки.")
             if st.button("Применить текущие модели и промпты к незавершённым этапам"):
                 action("Обновляю настройки запуска…", lambda: refresh_pending_config(store, run_id))
+            if not store.one("SELECT id FROM content_plans WHERE run_id=?", (run_id,)):
+                restart_confirmed = st.checkbox("Разрешаю новый платный анализ последнего импорта статистики")
+                if st.button("Использовать последний импорт и повторить анализ"):
+                    action("Обновляю входные данные…", lambda: restart_analytics(store, run_id, confirmed=restart_confirmed))
             calls = store.rows("SELECT call_key,status,error,result_json FROM ai_calls WHERE call_key LIKE ? "
                                 "AND call_key NOT LIKE '%:archived:%' ORDER BY created_at DESC", (f"run:{run_id}:%",))
             if calls:

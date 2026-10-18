@@ -4,20 +4,11 @@ from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
+from dzen_agent.analytics_contract import Analytics as Analytics, LegacyAnalytics as LegacyAnalytics
+
 
 class Output(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-
-class Analytics(Output):
-    summary: str = Field(min_length=1)
-    best_topics: list[str]
-    weak_topics: list[str]
-    useful_patterns: list[str]
-    headline_patterns: list[str]
-    recommendations: list[str]
-    topics_to_avoid: list[str]
-    opportunities: list[str]
 
 
 class Source(Output):
@@ -26,6 +17,38 @@ class Source(Output):
     title: str
     publication_date: str | None = None
     excerpt: str = ""
+
+
+class DiscoveryCandidate(Output):
+    id: str = Field(min_length=1)
+    topic: str = Field(min_length=1)
+    working_title: str
+    angle: str
+    why_now: str
+    audience_value: str
+    thesis: str
+    key_points: list[str]
+    research_questions: list[str]
+    source_ids: list[str] = Field(min_length=1)
+    kind: Literal["news", "evergreen"]
+    score: float = Field(ge=0, le=100)
+
+
+class Discovery(Output):
+    status: Literal["ok", "insufficient_sources"]
+    summary: str
+    candidates: list[DiscoveryCandidate]
+    sources: list[Source]
+    uncertainty: list[str]
+
+    @model_validator(mode="after")
+    def references(self):
+        ids = {s.id for s in self.sources}
+        if len(ids) != len(self.sources) or len({c.id for c in self.candidates}) != len(self.candidates):
+            raise ValueError("Повторяются идентификаторы Discovery.")
+        if any(not set(c.source_ids).issubset(ids) for c in self.candidates):
+            raise ValueError("Идея Discovery ссылается на неизвестный источник.")
+        return self
 
 
 class Claim(Output):

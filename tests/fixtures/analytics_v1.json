@@ -1,0 +1,16 @@
+{
+  "contract_version": "1.0",
+  "stage": "analytics",
+  "status": "partial",
+  "period": {"start": null, "end": null, "as_of": null, "timezone": "Europe/Moscow"},
+  "data_quality": {"articles_total": 2, "articles_usable": 2, "issues": ["Неизвестно окно измерения"], "missing_metrics": ["opens", "completions"], "comparison_limitations": ["Нет сопоставимого предыдущего периода"]},
+  "channel_diagnosis": {"trend": "unknown", "main_bottleneck": "unknown", "summary": "Для уверенных выводов не хватает сопоставимых данных."},
+  "funnel": {"impressions": null, "opens": null, "completions": null, "subscriptions": null, "ctr": null, "completion_rate": null, "completion_per_impression": null, "subscriptions_per_1000_opens": null},
+  "observations": [{"id": "O1", "finding": "Один материал получил 300 просмотров", "metric": "views", "value": 300, "comparison_value": null, "article_ids": ["a"], "sample_articles": 1, "sample_impressions": null, "sample_opens": null, "confidence": "low", "limitations": "Окно наблюдения неизвестно"}],
+  "interpretations": [{"id": "I1", "observation_ids": ["O1"], "interpretation": "Тема требует отдельной проверки", "alternative_explanations": ["Возраст публикаций может отличаться"], "confidence": "low"}],
+  "cluster_signals": [{"cluster": "История кино", "direction": "test", "article_count": 1, "evidence_ids": ["O1"], "confidence": "low", "reason": "Единственный материал не подтверждает закономерность"}],
+  "experiments": [{"id": "E1", "hypothesis": "Конкретные истории могут заинтересовать читателей", "change": "Проверить один новый ракурс", "comparison": "Материалы сопоставимого возраста", "primary_metric": "ctr", "guardrail_metrics": ["completion_rate"], "evaluation_conditions": "Только при наличии показов и открытий за одинаковое окно", "priority": "medium", "evidence_ids": ["O1"]}],
+  "discovery_brief": {"promising_directions": ["Истории реставрации киноплёнки", "Творческие решения на съёмках"], "underexplored_directions": ["Повседневная жизнь СССР в кино"], "avoid_repetition": ["Не повторять опубликованные подборки"], "research_questions": ["Какие производственные истории подтверждены первоисточниками?"]},
+  "planner_brief": {"content_mix_guidance": "Сочетать проверенные направления с небольшими экспериментами", "priority_clusters": ["История кино"], "caution_clusters": ["Однотипные подборки"], "headline_insights": ["Проверить конкретный производственный факт"], "format_insights": ["История одного фильма"], "priority_experiment_ids": ["E1"]},
+  "missing_data_requests": ["Укажите период измерения и определения открытий и дочитываний"]
+}

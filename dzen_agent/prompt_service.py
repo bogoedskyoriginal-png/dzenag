@@ -5,12 +5,15 @@ from pathlib import Path
 
 from dzen_agent.store import Store, dumps, now_iso
 
-PROMPT_TYPES = ("ANALYTICS", "RESEARCH", "PLANNER", "WRITER", "IMAGE", "EDITOR")
+PROMPT_TYPES = ("ANALYTICS", "DISCOVERY", "RESEARCH", "PLANNER", "WRITER", "IMAGE", "EDITOR")
 VARIABLES = {
     "statistics", "previous_statistics", "analytics", "research", "topic", "concept",
     "article_title", "article_body", "article_summary", "sources", "publication_date",
     "history", "used_topics", "article_count", "schedule", "channel_topic", "today",
     "plan", "week", "editorial_constraints",
+    "discovery", "discovery_brief", "planner_brief", "planning_candidates",
+    "run_context", "articles", "channel_metrics", "metric_definitions", "editorial_context",
+    "previous_analytics", "experiment_history", "analysis_config",
 }
 VARIABLE = re.compile(r"{{\s*([a-z_][a-z_0-9]*)\s*}}")
 
@@ -46,6 +49,8 @@ class Prompts:
     def seed(self) -> None:
         directory = Path(__file__).parent / "prompts"
         for kind in PROMPT_TYPES:
+            if kind == "DISCOVERY":
+                continue  # User approval is required; never silently author an active Discovery prompt.
             if self.active(kind):
                 continue
             if kind == "WRITER":

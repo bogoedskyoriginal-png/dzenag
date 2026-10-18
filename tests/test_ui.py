@@ -5,6 +5,8 @@ from streamlit.testing.v1 import AppTest
 
 from dzen_agent.config import PROJECT_ROOT, get_settings
 from dzen_agent.store import dumps
+from dzen_agent.store import Store
+from dzen_agent.statistics import import_csv, preview_csv
 
 
 def test_all_sections_render_without_key(tmp_path):
@@ -69,3 +71,26 @@ def test_editorial_chat_apply_and_approve_plan(editorial_plan):
         next(x for x in app.radio if x.label == "Назначение").set_value("EDITOR").run()
         assert not app.exception and not app.error
         assert "редакторский copilot" in next(x for x in app.text_area if x.label == "Текст промпта").value
+
+
+def test_v1_report_period_metadata_and_missing_discovery_prompt(tmp_path, analytics_v1):
+    config = replace(get_settings(), database_path=tmp_path / "ui-v1.db", aitunnel_api_key=None)
+    store = Store(config.database_path)
+    store.initialize()
+    import_id = import_csv(store, "stats.csv", preview_csv(b"article_id;title;views\na;A;300\nb;B;200"))
+    store.execute("INSERT INTO analytics_results(statistics_id,payload_json,created_at) VALUES(?,?,?)",
+                   (import_id, dumps(analytics_v1), "2026-10-18"))
+    with patch("dzen_agent.config.get_settings", return_value=config):
+        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui.py"), default_timeout=20).run()
+        app.sidebar.radio[0].set_value("Статистика").run()
+        assert not app.exception and not app.error
+        assert any("Analytics 1.0" in x.value for x in app.caption)
+        next(x for x in app.selectbox if x.label == "Окно измерения").set_value("first_7d").run()
+        next(x for x in app.button if x.label == "Сохранить сведения о периоде").click().run()
+        assert not app.exception and not app.error
+        assert 'first_7d' in store.one("SELECT metadata_json FROM statistics_imports")["metadata_json"]
+        app.sidebar.radio[0].set_value("Промпты").run()
+        next(x for x in app.radio if x.label == "Назначение").set_value("DISCOVERY").run()
+        assert not app.exception and not app.error
+        assert any("ещё не задан" in x.value for x in app.warning)
+        assert not store.one("SELECT id FROM prompt_versions WHERE prompt_type='DISCOVERY'")

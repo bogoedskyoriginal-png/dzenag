@@ -21,8 +21,15 @@ ALIASES = {
     "comments": ("комментарии", "comments"),
     "subscribers": ("подписки", "подписчики", "subscribers"),
     "ctr": ("ctr", "ctr, %", "ctr (%)", "кликабельность"),
+    "opens": ("opens", "открытия"),
+    "completions": ("completions",),
+    "subscriptions": ("subscriptions",),
+    "unsubscribes": ("unsubscribes", "отписки"),
+    "read_time_seconds": ("read_time_seconds", "время чтения, сек"),
+    "article_id": ("article_id", "id публикации"),
+    "status": ("status", "статус"),
 }
-METRICS = set(ALIASES) - {"title", "url", "date"}
+METRICS = set(ALIASES) - {"title", "url", "date", "article_id", "status"}
 
 
 @dataclass

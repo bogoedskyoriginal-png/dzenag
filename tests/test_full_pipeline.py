@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+from pathlib import Path
 
 import httpx
 from PIL import Image
@@ -21,6 +22,7 @@ def test_full_pipeline_resume_keeps_paid_text_and_images(tmp_path):
         store.set_setting(role + "_model", role)
     store.set_setting("max_articles_per_week", 2)
     store.set_setting("max_retries", 0)
+    store.set_setting("pipeline_flow", "legacy")
     import_csv(store, "stats.csv", preview_csv(b"title;views\nfirst;10\nsecond;3"))
     buffer = io.BytesIO()
     Image.new("RGB", (16, 16), "blue").save(buffer, "PNG")
@@ -38,12 +40,14 @@ def test_full_pipeline_resume_keeps_paid_text_and_images(tmp_path):
                 return httpx.Response(429, json={"error": "rate limit"})
             return httpx.Response(200, json={"data": [{"b64_json": base64.b64encode(
                 buffer.getvalue()).decode()}], "usage": {"cost_rub": 1, "balance": 490}})
-        context_text = payload["messages"][1]["content"].split("\nВерни только JSON по этой схеме:")[0]
-        context = json.loads(context_text.split("\n", 1)[1])
+        context_text = payload["messages"][1]["content"]
+        context = json.loads(context_text) if context_text.startswith("{") else json.loads(
+            context_text.split("\nВерни только JSON по этой схеме:")[0].split("\n", 1)[1])
         if role == "analytics":
-            output = {"summary": "Есть возможности", "best_topics": [], "weak_topics": [],
-                      "useful_patterns": [], "headline_patterns": [], "recommendations": [],
-                      "topics_to_avoid": [], "opportunities": topics}
+            output = json.loads((Path(__file__).parent / "fixtures" / "analytics_v1.json").read_text("utf-8"))
+            output["observations"][0]["article_ids"] = [context["articles"][0]["article_id"]]
+            output["observations"][0]["value"] = 10
+            output["discovery_brief"]["promising_directions"] = topics
         elif role == "research":
             output = {"status": "sufficient", "summary": context["topic"], "key_facts": ["Fact"],
                       "claims": [{"text": "Fact", "source_ids": ["s1"]}], "sources": [

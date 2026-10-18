@@ -1,6 +1,6 @@
 import sqlite3
 
-from dzen_agent.migrations import SCHEMA
+from dzen_agent.migrations import EDITORIAL_SCHEMA, SCHEMA
 from dzen_agent.store import Store
 
 
@@ -42,9 +42,33 @@ def test_v1_editorial_migration_keeps_existing_plan_and_articles(tmp_path):
     assert len(store.rows("SELECT * FROM pipeline_stages WHERE stage IN ('PLAN_REVIEW','REFRESH_RESEARCH')")) == 2
     assert all(row["status"] == "SUCCEEDED" for row in store.rows("SELECT status FROM pipeline_stages"))
     assert len(list((tmp_path / "backups").glob('*.db'))) == 1
-    assert store.one("PRAGMA user_version")["user_version"] == 2
+    assert store.one("PRAGMA user_version")["user_version"] == 3
     assert store.one("PRAGMA foreign_key_check") is None
     store.execute("INSERT INTO editorial_chat_messages(plan_id,role,content,created_at) VALUES(9,'user','Сохранено','now')")
     reopened = Store(path)
     reopened.initialize()
     assert reopened.one("SELECT content FROM editorial_chat_messages")["content"] == "Сохранено"
+
+
+def test_v2_to_v3_keeps_raw_analytics_prompt_and_run_snapshot(tmp_path):
+    path = tmp_path / "v2.db"
+    original = '{"summary":"Старый результат","best_topics":[],"weak_topics":[],"useful_patterns":[],"headline_patterns":[],"recommendations":[],"topics_to_avoid":[],"opportunities":[]}'
+    with sqlite3.connect(path) as conn:
+        conn.executescript(SCHEMA)
+        conn.executescript(EDITORIAL_SCHEMA)
+        conn.execute("PRAGMA user_version=2")
+        conn.execute("INSERT INTO prompt_versions(id,prompt_type,title,content,version,created_at,is_active) "
+                     "VALUES(33,'ANALYTICS','Мой Analytics','  Дословный текст\n',3,'2026-10-18',1)")
+        conn.execute("INSERT INTO pipeline_runs(id,week_start,mode,status,settings_json,prompts_json,created_at) "
+                     "VALUES(1,'2030-01-07','REVIEW','ERROR','{}','{}','2026-10-18')")
+        conn.execute("INSERT INTO analytics_results(run_id,payload_json,created_at) VALUES(1,?,'2026-10-18')", (original,))
+    store = Store(path)
+    before = store.rows("SELECT * FROM prompt_versions")
+    store.initialize()
+    store.initialize()
+    assert store.rows("SELECT * FROM prompt_versions") == before
+    assert store.one("SELECT payload_json,superseded FROM analytics_results") == {"payload_json": original, "superseded": 0}
+    assert store.one("SELECT settings_json FROM pipeline_runs")["settings_json"] == "{}"
+    assert store.one("PRAGMA user_version")["user_version"] == 3
+    assert store.one("PRAGMA integrity_check")["integrity_check"] == "ok"
+    assert len(list((tmp_path / "backups").glob('*.db'))) == 1

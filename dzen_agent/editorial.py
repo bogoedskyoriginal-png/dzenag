@@ -5,6 +5,7 @@ import json
 
 from pydantic import ValidationError
 
+from dzen_agent.analytics_contract import analytics_summary, briefs, parse_analytics
 from dzen_agent.errors import UserActionRequired, log_exception, redact
 from dzen_agent.locking import exclusive_lock
 from dzen_agent.prompt_service import Prompts, render
@@ -24,13 +25,22 @@ def build_chat_context(store: Store, plan_id: int) -> dict:
     concepts = store.rows("SELECT * FROM concepts WHERE plan_id=? ORDER BY scheduled_at,id", (plan_id,))
     if len(concepts) > 20:
         raise ValueError("Для груминга выберите план до 20 концептов.")
-    analytics = store.one("SELECT payload_json FROM analytics_results WHERE run_id=? ORDER BY id DESC LIMIT 1",
+    analytics = store.one("SELECT payload_json FROM analytics_results WHERE run_id=? AND superseded=0 ORDER BY id DESC LIMIT 1",
                           (plan["run_id"],))
     data = json.loads(analytics["payload_json"]) if analytics else {}
     compact_analytics = {key: [_text(item, 180) for item in value[:4]] if isinstance(value, list)
                          else _text(value, 700) for key, value in data.items() if key in (
                          "summary", "best_topics", "weak_topics", "useful_patterns", "headline_patterns",
                          "recommendations", "topics_to_avoid", "opportunities")}
+    if data.get("contract_version"):
+        result = parse_analytics(data)
+        _, planner = briefs(data)
+        compact_analytics = {"summary": _text(analytics_summary(data), 700), "status": result.status,
+            "issues": [_text(x, 180) for x in result.data_quality.issues[:4]],
+            "observations": [{"id": o.id, "finding": _text(o.finding, 250), "confidence": o.confidence}
+                             for o in result.observations[:4]],
+            "planner_brief": {key: [_text(x, 160) for x in value[:4]] if isinstance(value, list)
+                              else _text(value, 500) for key, value in planner.items()}}
     compact_concepts, research = [], []
     seen_research = set()
     for row in concepts:

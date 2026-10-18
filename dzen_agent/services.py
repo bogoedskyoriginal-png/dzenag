@@ -10,13 +10,14 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from dzen_agent.analytics_contract import analytics_summary, briefs, parse_analytics
+from dzen_agent.analytics_input import build_analytics_input
 from dzen_agent.errors import UserActionRequired
 from dzen_agent.database import _invalidate_run
 from dzen_agent.models import ArticleStatus
 from dzen_agent.prompt_service import Prompts, render
 from dzen_agent.provider import AITunnel, save_image_bytes
-from dzen_agent.schemas import Analytics, NewBody, NewTitle, Plan, Research, WrittenArticle
-from dzen_agent.statistics import statistics_context
+from dzen_agent.schemas import Analytics, Discovery, NewBody, NewTitle, Plan, Research, WrittenArticle
 from dzen_agent.store import MSK, Store, dumps, now_iso
 
 
@@ -89,17 +90,32 @@ class ContentService:
                 "today": datetime.now(MSK).date().isoformat(), **extra}
 
     def structured(self, kind, schema, context, call_key, *, article_id=None, operation=None):
-        model_key = {"ANALYTICS": "analytics_model", "RESEARCH": "research_model",
+        model_key = {"ANALYTICS": "analytics_model", "DISCOVERY": "discovery_model", "RESEARCH": "research_model",
                      "PLANNER": "planner_model", "WRITER": "writer_model"}[kind]
-        model = self.settings[model_key]
+        model = self.settings.get(model_key) or (self.settings.get("research_model") if kind == "DISCOVERY" else None)
         if not model:
             raise UserActionRequired("Выберите модели в разделе «Настройки / Модели».")
-        prompt = self.prompts[kind]
-        system = render(prompt["content"], context)
-        system += ("\n\nТехнический контракт приложения: итоговый ответ — только JSON по схеме ниже. "
+        prompt = self.prompts.get(kind)
+        if not prompt:
+            raise UserActionRequired(f"Добавьте и утвердите промпт {kind} в разделе «Промпты». "
+                                     "Существующие промпты не изменялись.")
+        template_values = context
+        if schema is Analytics:
+            template_values = {**context, "statistics": {"articles": context["articles"],
+                "analysis_config": context["analysis_config"]}, "previous_statistics": context["previous_analytics"] or {"available": False},
+                "history": context["editorial_context"].get("recent_publications", []),
+                "channel_topic": context["editorial_context"]["channel_topic"]}
+        system = render(prompt["content"], template_values)
+        system += (("\n\nСхема согласованного Analytics 1.0 для программной валидации:\n" if schema is Analytics else
+                   "\n\nТехнический контракт приложения: итоговый ответ — только JSON по схеме ниже. "
                    "Этот контракт заменяет прежние требования к форме JSON, сохраняя редакционные "
-                   "инструкции. Используй только переданные или найденные источники.\n"
+                   "инструкции. Используй только переданные или найденные источники.\n")
                    + dumps(schema.model_json_schema()))
+        if kind == "PLANNER" and "planning_candidates" in context:
+            system += ("\nПланирование идёт до глубокого Research. planning_candidates — идеи Discovery, "
+                       "research_job_id — зарезервированная задача исследования. Переданные research=[] "
+                       "не являются готовыми досье. Используй planner_brief для редакционных решений "
+                       "и discovery для новых идей; фактуру проверит Research после утверждения плана.")
         if schema.__name__ == "ContentQA":
             system += "\nЗадача этого вызова — проверить готовую статью по исследованию, а не написать новую."
         payload = {
@@ -112,7 +128,9 @@ class ContentService:
             "response_format": {"type": "json_object"},
             "max_tokens": int(self.settings["max_output_tokens"]),
         }
-        if kind == "RESEARCH" and self.settings.get("research_use_web_tool"):
+        if schema is Analytics:
+            payload["messages"][1]["content"] = dumps(context)
+        if kind in ("RESEARCH", "DISCOVERY") and self.settings.get("research_use_web_tool"):
             payload["tools"] = [{"type": "aitunnel:web_search", "parameters": {"max_uses": 1}}]
             payload["max_tool_calls"] = 1
         response = self.provider.call(
@@ -130,20 +148,60 @@ class ContentService:
         return result, response
 
     def analyze(self, statistics_id: int, call_key: str) -> int:
-        existing = self.store.one("SELECT id FROM analytics_results WHERE run_id=?", (self.run_id,)) \
+        existing = self.store.one("SELECT id FROM analytics_results WHERE run_id=? AND superseded=0 ORDER BY id DESC", (self.run_id,)) \
             if self.run_id else None
         if existing:
             return existing["id"]
-        current = self.store.one("SELECT * FROM statistics_imports WHERE id=?", (statistics_id,))
-        previous = self.store.one("SELECT * FROM statistics_imports WHERE id<? ORDER BY id DESC",
-                                  (statistics_id,))
-        result, _ = self.structured("ANALYTICS", Analytics, self.context(
-            statistics=statistics_context(current), previous_statistics=statistics_context(previous)),
-            call_key)
+        context = build_analytics_input(self.store, statistics_id, run_id=self.run_id)
+        result, _ = self.structured("ANALYTICS", Analytics, context, call_key)
+        try:
+            result.validate_input(context)
+        except ValueError as error:
+            raise UserActionRequired("Ответ Analytics нарушает контракт входных данных: " + str(error)
+                                     + " Оплаченный ответ сохранён без повторного запроса.") from error
         return self.store.execute(
             "INSERT INTO analytics_results(statistics_id,run_id,payload_json,prompt_version,created_at) "
             "VALUES(?,?,?,?,?)", (statistics_id, self.run_id, result.model_dump_json(),
                                   self.prompts["ANALYTICS"]["id"], now_iso()))
+
+    def discover(self, analytics: dict, call_key: str) -> int:
+        existing = self.store.one("SELECT * FROM discovery_results WHERE run_id=?", (self.run_id,))
+        revision = int(self.settings.get("analysis_revision", 0))
+        if existing and existing["analysis_revision"] == revision:
+            result = Discovery.model_validate_json(existing["payload_json"])
+            if result.status == "ok":
+                return existing["id"]
+            if self.store.one("SELECT call_key FROM ai_calls WHERE call_key=?", (call_key,)):
+                raise UserActionRequired("Discovery не нашёл достаточно подтверждённых идей. Ответ сохранён.")
+        parsed = parse_analytics(analytics)
+        if isinstance(parsed, Analytics) and parsed.status == "insufficient_data":
+            raise UserActionRequired("Analytics: недостаточно данных. Исправьте импорт перед платным Discovery.")
+        discovery_brief, _ = briefs(analytics)
+        result, response = self.structured("DISCOVERY", Discovery, self.context(
+            discovery_brief=discovery_brief, analytics={"summary": analytics_summary(analytics),
+            "contract_version": analytics.get("contract_version", "legacy"), "status": analytics.get("status", "legacy")},
+            article_count=self.settings["max_articles_per_week"]), call_key)
+        verified = citation_urls(response)
+        result.sources = [s for s in result.sources if str(s.url).rstrip("/") in verified]
+        ids = {s.id for s in result.sources}
+        used = [a.topic for a in self.store.list_all()]
+        candidates = []
+        for candidate in result.candidates:
+            if set(candidate.source_ids).issubset(ids) and not any(similar(candidate.topic, t) for t in used):
+                candidates.append(candidate)
+                used.append(candidate.topic)
+        result.candidates = candidates
+        if len(candidates) < self.settings["max_articles_per_week"]:
+            result.status = "insufficient_sources"
+            result.uncertainty.append("Недостаточно разных идей со ссылками из поискового ответа.")
+        self.store.execute("INSERT INTO discovery_results(run_id,payload_json,prompt_version,created_at,analysis_revision) "
+                           "VALUES(?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET payload_json=excluded.payload_json,"
+                           "prompt_version=excluded.prompt_version,created_at=excluded.created_at,analysis_revision=excluded.analysis_revision",
+                           (self.run_id, result.model_dump_json(), self.prompts["DISCOVERY"]["id"], now_iso(), revision))
+        result_id = self.store.one("SELECT id FROM discovery_results WHERE run_id=?", (self.run_id,))["id"]
+        if result.status != "ok":
+            raise UserActionRequired("Discovery не нашёл достаточно подтверждённых идей. Ответ сохранён.")
+        return result_id
 
     def research(self, topic: str, analytics: dict, call_key: str, *, cache_topic: str | None = None) -> int:
         # Editorial revisions need their own durable identity even when only the angle changed.
@@ -194,7 +252,8 @@ class ContentService:
         research = [{"research_job_id": r["id"], "topic": r["topic"],
                      **json.loads(r["payload_json"])} for r in research_rows]
         result, _ = self.structured("PLANNER", Plan, self.context(
-            analytics=analytics, research=research, article_count=len(slots), schedule=slots), call_key)
+            analytics=analytics, planner_brief=briefs(analytics)[1],
+            research=research, article_count=len(slots), schedule=slots), call_key)
         if len(result.concepts) != len(slots):
             raise UserActionRequired("План содержит неверное количество статей. Ответ сохранён.")
         used = [a.topic for a in self.store.list_all()]
@@ -220,6 +279,48 @@ class ContentService:
                              "scheduled_at,status) VALUES(?,?,?,?,?,'PLANNED')",
                              (plan_id, concept.research_job_id, concept.topic,
                               concept.model_dump_json(), slot))
+        return plan_id
+
+    def plan_from_discovery(self, analytics: dict, discovery: dict, week_start: str, call_key: str) -> int:
+        existing = self.store.one("SELECT id FROM content_plans WHERE run_id=?", (self.run_id,))
+        if existing:
+            return existing["id"]
+        result_discovery = Discovery.model_validate(discovery)
+        if result_discovery.status != "ok":
+            raise UserActionRequired("Сначала завершите Discovery с подтверждёнными источниками.")
+        candidates, lookup = [], {}
+        for candidate in result_discovery.candidates:
+            self.store.execute("INSERT OR IGNORE INTO research_jobs(run_id,topic,status,payload_json,created_at) "
+                               "VALUES(?,?,'pending','{}',?)", (self.run_id, candidate.topic, now_iso()))
+            job = self.store.one("SELECT id FROM research_jobs WHERE run_id=? AND topic=?", (self.run_id, candidate.topic))
+            item = {**candidate.model_dump(mode="json"), "research_job_id": job["id"]}
+            candidates.append(item)
+            lookup[job["id"]] = item
+        slots = week_slots(week_start, self.settings)
+        result, _ = self.structured("PLANNER", Plan, self.context(
+            analytics=analytics, planner_brief=briefs(analytics)[1], discovery=discovery,
+            planning_candidates=candidates, research=[], schedule=slots, article_count=len(slots)), call_key)
+        if len(result.concepts) != len(slots):
+            raise UserActionRequired("Planner вернул неверное количество концептов.")
+        used = [a.topic for a in self.store.list_all()]
+        selected = set()
+        for concept in result.concepts:
+            candidate = lookup.get(concept.research_job_id)
+            if not candidate or concept.research_job_id in selected:
+                raise UserActionRequired("Planner использовал неизвестную или повторную идею Discovery.")
+            if not set(concept.research_source_ids).issubset(candidate["source_ids"]):
+                raise UserActionRequired("Planner сослался на неизвестные источники Discovery.")
+            if any(similar(concept.topic, topic) for topic in used):
+                raise UserActionRequired("Planner предложил повтор существующей темы.")
+            selected.add(concept.research_job_id)
+            used.append(concept.topic)
+        with self.store._connect() as conn:
+            plan_id = conn.execute("INSERT INTO content_plans(run_id,week_start,created_at) VALUES(?,?,?)",
+                                   (self.run_id, week_start, now_iso())).lastrowid
+            for concept, slot in zip(result.concepts, slots, strict=True):
+                conn.execute("INSERT INTO concepts(plan_id,research_id,topic,payload_json,scheduled_at,status,needs_research) "
+                             "VALUES(?,?,?,?,?,'RESEARCH_REQUIRED',1)",
+                             (plan_id, concept.research_job_id, concept.topic, concept.model_dump_json(), slot))
         return plan_id
 
     def write(self, topic: str, research_id: int, call_key: str, *, concept_row=None,
@@ -382,6 +483,9 @@ def qa_article(store: Store, article_id: int) -> dict:
         done = {s["stage"] for s in stages if s["status"] == "SUCCEEDED"}
         missing = {"COLLECT_STATS", "ANALYZE", "RESEARCH", "PLAN", "PLAN_REVIEW", "REFRESH_RESEARCH",
                    "WRITE", "IMAGE"} - done
+        run = store.one("SELECT settings_json FROM pipeline_runs WHERE id=?", (detail["run_id"],))
+        if run and json.loads(run["settings_json"]).get("pipeline_flow") == "analytics_v1" and "DISCOVERY" not in done:
+            missing.add("DISCOVERY")
         if missing:
             issues.append("Не завершены этапы: " + ", ".join(sorted(missing)))
     result = {"passed": not issues, "issues": issues, "checked_at": now_iso(),

@@ -86,7 +86,7 @@ def choose_defaults(catalog: dict) -> dict:
     image = min(generation, key=lambda k: float(images[k].get("max_price_per_image", 1e10))) \
         if generation else ""
     return {"analytics_model": text, "planner_model": text, "writer_model": text,
-            "research_model": research_model, "image_model": image}
+            "research_model": research_model, "discovery_model": research_model, "image_model": image}
 
 
 def save_image_bytes(raw: bytes, target: Path) -> str:
