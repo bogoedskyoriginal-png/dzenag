@@ -37,7 +37,7 @@ def estimate_operations(settings: dict) -> dict:
         "Изображения": count, "AI-проверки": count if settings["ai_qa_enabled"] else 0}
 
 
-def create_run(store: Store, week: str | None = None) -> int:
+def create_run(store: Store, week: str | None = None, *, settings_override: dict | None = None) -> int:
     week = week or next_week()
     day = datetime.fromisoformat(week)
     if day.weekday() != 0:
@@ -46,6 +46,12 @@ def create_run(store: Store, week: str | None = None) -> int:
     if existing:
         return existing["id"]
     settings = store.settings()
+    if settings_override:
+        allowed = {"max_articles_per_week", "publication_days", "publication_time", "publication_times",
+                   "publication_slots", "max_articles_per_day"}
+        if set(settings_override) - allowed:
+            raise ValueError("Мастер недели может изменять только число статей и расписание.")
+        settings.update(settings_override)
     settings.setdefault("pipeline_flow", "analytics_v1")
     slots = week_slots(week, settings)
     if any(datetime.fromisoformat(slot) <= datetime.now(MSK) for slot in slots):

@@ -7,9 +7,7 @@ from dzen_agent.prompt_service import Prompts
 from dzen_agent.store import Store
 from dzen_agent.ui_pages import PAGES, handle_error
 
-st.set_page_config(page_title="Dzen Agent", page_icon="✍️", layout="wide")
-st.title("Dzen Agent")
-st.caption("Контент, исследования и подготовка публикаций · время по Москве")
+st.set_page_config(page_title="Dzen Agent · Перемотка", page_icon="🗞️", layout="wide")
 
 try:
     config = get_settings()
@@ -17,18 +15,33 @@ try:
     store.initialize()
     Prompts(store).seed()
     settings = store.settings()
+    if "nav_requested" in st.session_state:
+        st.session_state.navigation = st.session_state.pop("nav_requested")
     with st.sidebar:
-        section = st.radio("Раздел", list(PAGES))
-        st.caption(f"Режим: {settings['mode']}")
-        if st.button("🛑 Остановить автопилот", type="primary", use_container_width=True):
+        st.title("Dzen Agent")
+        st.caption("Редакция «Перемотки»")
+        section = st.radio("Раздел", list(PAGES), key="navigation", label_visibility="collapsed")
+        st.divider()
+        st.caption("Локальная редакционная система\n\nВремя публикаций · Москва")
+        running = store.one("SELECT id FROM pipeline_runs WHERE status='RUNNING'") or st.session_state.get("dispatch")
+        def stop_agent():
             store.set_setting("stop_requested", True)
             store.set_setting("scheduler_enabled", False)
             store.set_setting("mode", "REVIEW")
-            st.rerun()
+            st.session_state.pop("dispatch", None)
+        if running:
+            st.button("Остановить агента", on_click=stop_agent, width="stretch")
+            st.caption("Уже отправленный AI-запрос может завершиться и быть оплачен.")
+        else:
+            with st.expander("Управление агентом"):
+                st.button("Остановить агента", on_click=stop_agent, width="stretch")
         if settings["stop_requested"]:
-            st.warning("Агент остановлен. Готовые результаты сохранены.")
+            st.warning("Остановка запрошена" if running else "Агент приостановлен")
+            if st.button("Разрешить продолжение работы"):
+                store.set_setting("stop_requested", False)
+                st.rerun()
         if not config.aitunnel_api_key:
-            st.info("Ключ AITUNNEL не добавлен в .env. AI-операции пока недоступны.")
+            st.caption("AI пока недоступен: добавьте ключ AITUNNEL в .env.")
     PAGES[section](store, config)
 except Exception as error:
     handle_error(error)

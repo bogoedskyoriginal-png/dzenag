@@ -398,11 +398,12 @@ def test_twenty_one_concepts_and_custom_slots_render_in_streamlit(native_run):
         app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent/ui.py"), default_timeout=20).run()
         app.sidebar.radio[0].set_value("Контент-план").run()
         assert not app.exception and not app.error
+        next(x for x in app.radio if x.label == "Представление плана").set_value("Все концепты").run()
         assert any(len(frame.value) == 21 for frame in app.dataframe)
-        app.sidebar.radio[0].set_value("Настройки / Модели").run()
+        app.sidebar.radio[0].set_value("Настройки").run()
         assert not app.exception and not app.error
-        assert next(x for x in app.number_input if x.label == "Статей в неделю").value == 21
-        assert next(x for x in app.text_input if x.label == "Временные слоты по Москве через запятую").value == "05:00, 06:00, 16:00"
+        assert next(x for x in app.number_input if x.label == "Публикаций за неделю").value == 21
+        assert next(x for x in app.text_input if x.label == "Время публикаций по Москве").value == "05:00, 06:00, 16:00"
 
 
 def test_twenty_one_long_concepts_are_not_silently_omitted(native_run):

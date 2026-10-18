@@ -25,8 +25,8 @@ def _format(value, field):
 def grooming_panel(store, config, plan_id):
     from dzen_agent.ui_pages import action
 
-    st.subheader("Груминг контент-плана")
-    st.caption("Используется модель Planner. Чат ничего не меняет без кнопки «Применить».")
+    st.subheader("Редакторский чат")
+    st.caption("Обсуждение с AI оплачивается. Чат ничего не меняет без кнопки «Применить».")
     chat = EditorialChat(store, AITunnel(store, config.aitunnel_api_key))
     blocked = editing_reason(store, plan_id)
     messages = chat.messages(plan_id)
@@ -58,8 +58,8 @@ def grooming_panel(store, config, plan_id):
                         for change in preview["diff"]:
                             label = FIELD_NAMES.get(change["field"], change["field"])
                             st.markdown(f"**{label}**")
-                            st.write("Сейчас:", _format(change["before"], change["field"]))
-                            st.write("Предлагается:", _format(change["after"], change["field"]))
+                            st.write("Было:", _format(change["before"], change["field"]))
+                            st.write("Стало:", _format(change["after"], change["field"]))
                         if preview["needs_research"]:
                             st.info("Для изменённой темы потребуется новое исследование.")
                     except ValueError as error:

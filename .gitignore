@@ -5,7 +5,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
 data/*.db*
 browser-profile/
 .playwright/
