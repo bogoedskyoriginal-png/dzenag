@@ -72,11 +72,24 @@ def citation_urls(response: dict) -> set[str]:
         if isinstance(item, dict) and item.get("url"):
             urls.add(item["url"].rstrip("/"))
     for choice in response.get("choices", []):
-        for item in choice.get("message", {}).get("annotations", []) or []:
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            continue
+        for item in choice["message"].get("annotations", []) or []:
+            if not isinstance(item, dict):
+                continue
             citation = item.get("url_citation", {})
-            if citation.get("url"):
+            if isinstance(citation, dict) and isinstance(citation.get("url"), str):
                 urls.add(citation["url"].rstrip("/"))
     return urls
+
+
+def search_evidence_summary(response):
+    annotations = [item for choice in response.get("choices", []) if isinstance(choice, dict)
+                   for item in (choice.get("message") or {}).get("annotations", []) or [] if isinstance(item, dict)]
+    return {"citations_count": len(response.get("citations") or []),
+            "search_results_count": len(response.get("search_results") or []),
+            "annotations_count": len(annotations), "source_url_count": len(citation_urls(response)),
+            "upstream_fields": response.get("search_metadata", "unknown_for_legacy_receipt")}
 
 
 def ground_research(research: Research, response: dict) -> Research:
@@ -175,13 +188,21 @@ class ContentService:
         require_complete_response(response)
         try:
             content = response["choices"][0]["message"]["content"]
-            result = schema.model_validate_json(content)
-        except (KeyError, IndexError, TypeError, ValidationError) as error:
+            from dzen_agent.editorial_contracts import DiscoveryV1
+            if schema is DiscoveryV1:
+                from dzen_agent.discovery_validation import parse_discovery
+                result, issues = parse_discovery(content)
+                response = {**response, "discovery_validation": issues}
+            else:
+                result = schema.model_validate_json(content)
+        except (KeyError, IndexError, TypeError, ValueError) as error:
             details = ""
             if isinstance(error, ValidationError):
                 details = " Ошибки: " + "; ".join(
                     f"{'.'.join(map(str, e['loc'])) or 'JSON'}: {e['type']} ({e['msg']})"
                     for e in error.errors(include_input=False, include_url=False)[:8])
+            elif isinstance(error, json.JSONDecodeError):
+                details = f" Некорректный JSON: {error.msg}, строка {error.lineno}, столбец {error.colno}."
             raise UserActionRequired(
                 "Модель вернула ответ, не соответствующий структуре. Оплаченный ответ сохранён; "
                 "автоматически повторно оплачивать его не будем." + details

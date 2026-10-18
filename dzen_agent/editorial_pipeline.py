@@ -65,7 +65,8 @@ def validate_run(result, service):
 
 
 def discover(service, analytics, call_key):
-    from dzen_agent.services import citation_urls, similar
+    from dzen_agent.services import citation_urls, similar, search_evidence_summary
+    from dzen_agent.discovery_validation import reject
     revision = int(service.settings.get("analysis_revision", 0))
     old = service.store.one("SELECT * FROM discovery_results WHERE run_id=?", (service.run_id,))
     if old and old["analysis_revision"] == revision:
@@ -90,20 +91,41 @@ def discover(service, analytics, call_key):
     observations = {o["id"] for o in analytics.get("observations", [])}
     article_ids = {r["article_id"] for r in published + scheduled}
     used = [r["topic"] for r in published + scheduled]
+    issues = list(response.get("discovery_validation", []))
+    accepted = []
     for idea in result.candidates:
-        refs(idea.analytics_observation_ids, observations, "analytics_observation_ids")
-        refs(idea.possible_duplicate_article_ids, article_ids, "possible_duplicate_article_ids")
+        try:
+            refs(idea.analytics_observation_ids, observations, "analytics_observation_ids")
+            refs(idea.possible_duplicate_article_ids, article_ids, "possible_duplicate_article_ids")
+        except ValueError as error:
+            reject(result, idea.model_dump(), str(error))
+            issues.append({"idea_id": idea.idea_id, "type": "unknown_context_reference", "message": str(error)})
+            continue
         grounded = all(str(s.url).rstrip("/") in allowed for s in idea.sources)
-        if not grounded or any(similar(idea.topic, t) for t in used):
+        unsupported = any(f.claim.strip() and not f.source_ids for f in idea.anchor_facts)
+        if not grounded or unsupported:
+            message = "Источники не подтверждены поисковыми метаданными или факт не имеет источника."
+            reject(result, idea.model_dump(), message, reason_code="insufficient_sources")
+            issues.append({"idea_id": idea.idea_id, "type": "ungrounded_candidate", "message": message})
+            continue
+        if any(similar(idea.topic, t) for t in used):
             idea.viability_status = "needs_validation"
-            idea.risks.append("Источники не подтверждены поисковым ответом либо есть повтор темы.")
+            idea.risks.append("Есть риск повтора темы.")
         if idea.viability_status == "ready_for_planning":
             used.append(idea.topic)
+        accepted.append(idea)
+    result.candidates = accepted
     ready = [i for i in result.candidates if i.viability_status == "ready_for_planning"]
     if not ready:
         result.status = "insufficient_data"
     elif len(ready) < service.settings["max_articles_per_week"]:
         result.status = "partial"
+    elif issues and result.status == "ok":
+        result.status = "partial"
+    result = DiscoveryV1.model_validate(result.model_dump(mode="json"))
+    service.store.log("DISCOVERY_VALIDATION", "Локальная проверка кандидатов Discovery без изменения оплаченного ответа", {
+        "run_id": service.run_id, "call_key": call_key, "issues": issues, "accepted_ids": [i.idea_id for i in result.candidates],
+        "ready_ids": [i.idea_id for i in ready], "search_evidence": search_evidence_summary(response)})
     service.store.execute("INSERT INTO discovery_results(run_id,payload_json,prompt_version,created_at,analysis_revision) "
         "VALUES(?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET payload_json=excluded.payload_json,"
         "prompt_version=excluded.prompt_version,created_at=excluded.created_at,analysis_revision=excluded.analysis_revision",
@@ -123,6 +145,9 @@ def plan(service, analytics, discovery, week_start, call_key):
     if not candidates:
         raise UserActionRequired("Нет подтверждённых кандидатов Discovery.")
     slots = week_slots(week_start, service.settings)
+    if len(candidates) < len(slots):
+        raise UserActionRequired(f"Для плана нужны {len(slots)} разные подтверждённые идеи Discovery; доступно {len(candidates)}. "
+                                 "Planner не запускался. Нельзя заполнять недобор непроверенными темами.")
     published, scheduled = history(service)
     _, planner_brief = briefs(analytics)
     context = {"run_context": run_context(service), "planning_config": {

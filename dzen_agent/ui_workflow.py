@@ -11,7 +11,7 @@ from dzen_agent.editorial_pipeline import preflight
 from dzen_agent.locking import exclusive_lock
 from dzen_agent.pipeline.orchestrator import create_run, estimate_operations, next_week, stages_for
 from dzen_agent.prompt_service import Prompts
-from dzen_agent.recovery import authorize_retry
+from dzen_agent.recovery import authorize_retry, reprocess_discovery
 from dzen_agent.services import week_slots
 from dzen_agent.store import MSK
 
@@ -31,6 +31,7 @@ STATUS = {"PENDING": "Ожидает", "RUNNING": "В работе", "ERROR": "�
 STATUS.update({"PREPARING_IN_DZEN": "Начинается перенос", "CREATING_DRAFT": "Создаётся черновик",
     "RENDERING": "Идёт вёрстка", "DRAFT_READY": "Черновик свёрстан", "SAVING_SCHEDULE": "Сохраняется отложенная статья",
     "SCHEDULED_PENDING_VERIFY": "Проверяется расписание"})
+STATUS["DISCOVERY_READY"] = "Поиск тем обработан; планирование ещё не запускалось"
 DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
@@ -240,10 +241,21 @@ def recovery_panel(store, config, run, stage):
         return
     if receipt["status"] == "SUCCEEDED":
         st.caption("Ответ уже оплачен. После исправления кода его можно проверить без повторной оплаты этого запроса.")
-        st.caption("Если ответ пройдёт проверку, подготовка продолжится на следующих платных этапах.")
-        if st.button("Продолжить с сохранённым ответом", disabled=not config.aitunnel_api_key, key=f"replay-{run['id']}"):
-            if queue_run(store, run["id"]):
-                st.rerun()
+        if stage["stage"] == "DISCOVERY":
+            from dzen_agent.services import search_evidence_summary
+            evidence = search_evidence_summary(json.loads(receipt["result_json"]))
+            st.caption(f"Поисковых URL: {evidence['source_url_count']}; аннотаций: {evidence['annotations_count']}; "
+                       f"citations: {evidence['citations_count']}; search_results: {evidence['search_results_count']}.")
+            st.caption("Локальная проверка не обращается к Sonar и не запускает Planner.")
+            if st.button("Обработать сохранённый Discovery бесплатно", key=f"replay-{run['id']}"):
+                if action("Проверяю оплаченный ответ локально…", lambda: reprocess_discovery(store, run["id"]),
+                          success="Ответ обработан. Planner не запускался."):
+                    st.rerun()
+        else:
+            st.caption("Если ответ пройдёт проверку, подготовка продолжится на следующих платных этапах.")
+            if st.button("Продолжить с сохранённым ответом", disabled=not config.aitunnel_api_key, key=f"replay-{run['id']}"):
+                if queue_run(store, run["id"]):
+                    st.rerun()
     st.caption("Новый ответ модели потребует отдельной оплаты. При неизвестном результате сначала сверьте историю AITUNNEL.")
     approved = st.checkbox("Я проверил расходы и разрешаю новый платный запрос", key=f"consent-{run['id']}")
     analytics = stage["stage"] == "ANALYZE"
@@ -332,6 +344,8 @@ def run_card(store, config, run_id):
                     st.warning(item["error"])
         elif stage:
             receipt = failed_receipt(store, run, stage["stage"]) if stage["status"] == "ERROR" else None
+            discovery_row = store.one("SELECT payload_json FROM discovery_results WHERE run_id=?", (run_id,)) if stage["stage"] == "PLAN" else None
+            discovery = json.loads(discovery_row["payload_json"]) if discovery_row else {}
             if stage["status"] == "ERROR" and receipt:
                 st.warning("Не удалось завершить этап «" + STAGES[stage["stage"]] + "».")
                 st.caption(error_explanation(run, stage, receipt))
@@ -339,6 +353,23 @@ def run_card(store, config, run_id):
                     st.session_state[f"recover-{run_id}"] = True
                 if st.session_state.get(f"recover-{run_id}"):
                     recovery_panel(store, config, run, stage)
+            elif stage["stage"] == "PLAN" and discovery.get("stage") == "discovery":
+                candidates = discovery["candidates"]
+                ready_count = sum(i["viability_status"] == "ready_for_planning" for i in candidates)
+                target = json.loads(run["settings_json"])["max_articles_per_week"]
+                st.info(f"Discovery сохранён. Готовых идей: {ready_count} из {target}. Planner ещё не запускался.")
+                st.dataframe([{"Идея": i["idea_id"], "Тема": i["topic"], "Статус": {
+                    "ready_for_planning": "Можно планировать", "needs_validation": "Нужна проверка", "rejected": "Отклонена"}[i["viability_status"]]}
+                    for i in candidates], hide_index=True)
+                if ready_count < target:
+                    st.warning("Для полного плана не хватает подтверждённых идей. Платный Planner заблокирован; непроверенные темы не подставляются.")
+                elif st.button("Перейти к планированию (платно)", disabled=not config.aitunnel_api_key, key=f"plan-paid-{run_id}"):
+                    queue_run(store, run_id)
+                    st.rerun()
+                if discovery["rejected_ideas"]:
+                    with st.expander("Почему некоторые идеи исключены"):
+                        for rejected in discovery["rejected_ideas"]:
+                            st.write(rejected["topic"] + ": " + rejected["reason"])
             elif stage["stage"] == "COLLECT_STATS" and not store.one("SELECT id FROM statistics_imports"):
                 st.info("Сначала загрузите статистику вашего канала.")
                 if st.button("Загрузить статистику", type="primary", key=f"stats-{run_id}"):

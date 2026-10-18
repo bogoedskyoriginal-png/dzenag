@@ -191,6 +191,8 @@ class AITunnel:
                         result = {"choices": data["choices"], "usage": data.get("usage"),
                                   "citations": data.get("citations", []),
                                   "search_results": data.get("search_results", []),
+                                  "search_metadata": {"citations_field_present": "citations" in data,
+                                                      "search_results_field_present": "search_results" in data},
                                   "model": data.get("model", model)}
                         if operation == "ANALYTICS":
                             result["analytics_request"] = {"model": model, **payload}
