@@ -16,7 +16,7 @@ def read_metadata(row: dict | None) -> dict:
 
 
 def validate_metadata(value: dict) -> dict:
-    allowed = {"measurement_window", "period", "metric_definitions", "subscription_attribution_confirmed"}
+    allowed = {"measurement_window", "period", "metric_definitions", "subscription_attribution_confirmed", "source"}
     if set(value) - allowed:
         raise ValueError("Неизвестные настройки периода статистики.")
     window = value.get("measurement_window", "unknown")

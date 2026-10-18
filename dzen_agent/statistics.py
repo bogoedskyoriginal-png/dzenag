@@ -5,13 +5,13 @@ import hashlib
 import io
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dzen_agent.store import Store, dumps, now_iso
 
 ALIASES = {
-    "title": ("название", "заголовок", "название публикации", "название статьи", "title", "name"),
+    "title": ("название", "заголовок", "название публикации", "название статьи", "публикация", "title", "name"),
     "url": ("ссылка", "url", "ссылка на публикацию", "ссылка на статью"),
     "date": ("дата", "дата публикации", "published_at", "date"),
     "views": ("просмотры", "просмотры публикации", "views"),
@@ -40,11 +40,25 @@ class CSVPreview:
     encoding: str
     delimiter: str
     sha256: str
+    source_format: str = "csv"
+    sheet_name: str | None = None
+    header_row: int = 1
+    row_numbers: list[int] = field(default_factory=list)
+    source_sha256: str | None = None
 
 
 def detect_mapping(columns: list[str]) -> dict[str, str]:
     return {column: key for column in columns for key, aliases in ALIASES.items()
-            if column.strip().lower().replace("ё", "е") in aliases}
+            if " ".join(column.lower().replace("ё", "е").split()) in aliases}
+
+
+def preview_statistics(raw: bytes, filename: str, *, sheet_name=None, header_row=None) -> CSVPreview:
+    if Path(filename).suffix.lower() == ".xlsx":
+        from dzen_agent.statistics_excel import preview_excel
+        return preview_excel(raw, sheet_name=sheet_name, header_row=header_row)
+    if Path(filename).suffix.lower() not in (".csv", ".tsv", ".txt"):
+        raise ValueError("Поддерживаются XLSX, CSV, TSV и TXT.")
+    return preview_csv(raw)
 
 
 def preview_csv(raw: bytes) -> CSVPreview:
@@ -106,11 +120,22 @@ def normalize_rows(preview: CSVPreview, mapping: dict[str, str] | None = None) -
         raise ValueError("Одному показателю назначено несколько колонок.")
     if not set(mapping).issubset(preview.columns) or not set(mapping.values()).issubset(ALIASES):
         raise ValueError("Некорректное сопоставление колонок.")
+    targets = [mapping.get(column, column) for column in preview.columns]
+    if len(set(targets)) != len(targets):
+        raise ValueError("Сопоставление перезапишет другую колонку. Назначьте колонкам разные показатели.")
     result = []
-    for index, row in enumerate(preview.rows, 2):
+    for position, row in enumerate(preview.rows):
+        index = preview.row_numbers[position] if preview.row_numbers else position + 2
         normalized = {mapping.get(k, k): v for k, v in row.items()}
+        if preview.source_format == "xlsx":
+            for column in set(mapping.values()) - METRICS:
+                if normalized[column] is None:
+                    normalized[column] = ""
+                elif not isinstance(normalized[column], str):
+                    normalized[column] = str(normalized[column])
         for column in set(mapping.values()) & METRICS:
-            value = re.sub(r"[\s\u00a0%]", "", str(normalized[column])).replace(",", ".")
+            original = normalized[column]
+            value = re.sub(r"[\s\u00a0%]", "", str(original if original is not None else "")).replace(",", ".")
             if value in ("", "-", "—"):
                 normalized[column] = None
                 continue
@@ -118,7 +143,7 @@ def normalize_rows(preview: CSVPreview, mapping: dict[str, str] | None = None) -
                 number = float(value)
                 if number < 0 or not __import__('math').isfinite(number):
                     raise ValueError()
-                normalized[column] = number
+                normalized[column] = original if isinstance(original, int) and not isinstance(original, bool) else number
             except ValueError as error:
                 raise ValueError(f"Строка {index}, {column}: ожидается число.") from error
         result.append(normalized)
@@ -130,12 +155,21 @@ def import_csv(store: Store, filename: str, preview: CSVPreview, mapping=None) -
     if existing:
         return existing["id"]
     rows = normalize_rows(preview, mapping)
+    metadata = {}
+    if preview.source_format == "xlsx":
+        metadata["source"] = {"format": "xlsx", "sheet_name": preview.sheet_name,
+            "header_row": preview.header_row, "file_sha256": preview.source_sha256,
+            "percent_values": "percentage_points"}
     return store.execute(
         "INSERT INTO statistics_imports(filename,sha256,encoding,delimiter,columns_json,rows_json,"
-        "created_at) VALUES(?,?,?,?,?,?,?)",
+        "created_at,metadata_json) VALUES(?,?,?,?,?,?,?,?)",
         (Path(filename).name, preview.sha256, preview.encoding, preview.delimiter,
-         dumps(mapping or preview.mapping), dumps(rows), now_iso()),
+         dumps(mapping if mapping is not None else preview.mapping), dumps(rows), now_iso(), dumps(metadata)),
     )
+
+
+# The existing name stays callable for old integrations; both formats share validation and storage.
+import_statistics = import_csv
 
 
 def statistics_context(row: dict | None) -> dict:

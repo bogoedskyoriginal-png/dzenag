@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -21,7 +22,8 @@ from dzen_agent.prompt_service import PROMPT_TYPES, VARIABLES, Prompts
 from dzen_agent.provider import AITunnel, choose_defaults, fetch_catalog
 from dzen_agent.recovery import authorize_retry, refresh_pending_config, restart_analytics
 from dzen_agent.services import ContentService, qa_article, week_slots
-from dzen_agent.statistics import ALIASES, import_csv, preview_csv
+from dzen_agent.statistics import ALIASES, import_statistics, preview_statistics
+from dzen_agent.statistics_excel import excel_sheets
 from dzen_agent.store import MSK, dumps, now_iso
 
 DAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
@@ -173,12 +175,26 @@ def dashboard(store, config):
 
 def statistics_page(store, config):
     st.subheader("Статистика канала")
-    upload = st.file_uploader("Выгрузка статистики Дзена", type=["csv", "tsv", "txt"])
+    upload = st.file_uploader("Выгрузка статистики Дзена", type=["xlsx", "csv", "tsv", "txt"])
     if upload:
         try:
-            preview = preview_csv(upload.getvalue())
-            st.caption(f"Строк: {len(preview.rows)} · кодировка: {preview.encoding} · "
-                       f"разделитель: {repr(preview.delimiter)}")
+            raw = upload.getvalue()
+            sheet_name, header_row = None, None
+            if Path(upload.name).suffix.lower() == ".xlsx":
+                file_key = hashlib.sha256(raw).hexdigest()
+                sheets = excel_sheets(raw)
+                sheet_name = st.selectbox("Лист Excel", sheets, key=f"sheet-{file_key}") if len(sheets) > 1 else sheets[0]
+                if st.checkbox("Выбрать строку заголовков вручную", key=f"header-manual-{file_key}-{sheet_name}"):
+                    header_row = st.number_input("Номер строки заголовков", 1, 50, 1,
+                        key=f"header-row-{file_key}-{sheet_name}")
+            preview = preview_statistics(raw, upload.name, sheet_name=sheet_name, header_row=header_row)
+            if preview.source_format == "xlsx":
+                st.caption(f"Лист: {preview.sheet_name} · строка заголовков: {preview.header_row} · строк данных: {len(preview.rows)}")
+                st.caption("Процентные ячейки приводятся к единицам CSV: 3,5% → 3,5. "
+                           "Все колонки сохраняются, включая не сопоставленные с показателями.")
+            else:
+                st.caption(f"Строк: {len(preview.rows)} · кодировка: {preview.encoding} · "
+                           f"разделитель: {repr(preview.delimiter)}")
             st.dataframe(preview.rows[:30], hide_index=True, use_container_width=True)
             mapping = {}
             with st.expander("Сопоставить колонки", expanded=not preview.mapping):
@@ -190,14 +206,16 @@ def statistics_page(store, config):
                     if target != "Сохранить как есть":
                         mapping[column] = target
             if st.button("Сохранить импорт", type="primary"):
-                result = action("Сохраняю статистику…", lambda: import_csv(store, upload.name, preview, mapping))
+                result = action("Сохраняю статистику…", lambda: import_statistics(store, upload.name, preview, mapping))
                 if result:
                     st.info(f"Импорт №{result} сохранён.")
         except ValueError as error:
             st.error(str(error))
-    imports = store.rows("SELECT id,filename,created_at,encoding FROM statistics_imports ORDER BY id DESC")
+    imports = store.rows("SELECT id,filename,created_at,encoding,metadata_json FROM statistics_imports ORDER BY id DESC")
     if imports:
-        st.dataframe(imports, hide_index=True, use_container_width=True)
+        st.dataframe([{**{k: v for k, v in r.items() if k != "metadata_json"},
+                       "Лист": json.loads(r["metadata_json"]).get("source", {}).get("sheet_name", "")}
+                      for r in imports], hide_index=True, use_container_width=True)
         selected = st.selectbox("Импорт для анализа", [r["id"] for r in imports])
         if st.button("Проанализировать статистику", disabled=not config.aitunnel_api_key):
             action("Анализирую…", lambda: service(store, config).analyze(selected, "analytics:" + uuid4().hex))
@@ -217,7 +235,7 @@ def statistics_page(store, config):
             start = st.date_input("Начало периода, если известно", value=datetime.fromisoformat(period["start"]).date() if period.get("start") else None)
             end = st.date_input("Конец периода, если известно", value=datetime.fromisoformat(period["end"]).date() if period.get("end") else None)
             as_of = st.date_input("Дата формирования выгрузки, если известна", value=datetime.fromisoformat(period["as_of"]).date() if period.get("as_of") else None)
-            attribution = st.checkbox("Подписки в CSV достоверно относятся к отдельным статьям", value=metadata.get("subscription_attribution_confirmed", False))
+            attribution = st.checkbox("Подписки в выгрузке достоверно относятся к отдельным статьям", value=metadata.get("subscription_attribution_confirmed", False))
             if st.button("Сохранить сведения о периоде"):
                 def save_metadata():
                     value = validate_metadata({**metadata, "measurement_window": window,
