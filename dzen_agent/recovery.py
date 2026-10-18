@@ -8,6 +8,88 @@ from dzen_agent.prompt_service import Prompts
 from dzen_agent.store import dumps, now_iso
 
 
+def reprocess_research(store, run_id: int, concept_id: int):
+    """Only replay the exact paid Research receipt for the approved concept version."""
+    import json
+    import sqlite3
+    from datetime import UTC, datetime
+    from dzen_agent.editorial_pipeline import native
+    from dzen_agent.pipeline.orchestrator import Pipeline
+    from dzen_agent.pipeline.items import item_fingerprint
+    from dzen_agent.services import ContentService
+    from dzen_agent.ai_response import require_complete_response
+    from dzen_agent.research_validation import parse_research
+
+    with exclusive_lock(store.database_path.parent / "pipeline.lock"), exclusive_lock(store.database_path.parent / "ai.lock"):
+        run = store.one("SELECT * FROM pipeline_runs WHERE id=?", (run_id,))
+        concept = store.one("SELECT c.* FROM concepts c JOIN content_plans p ON p.id=c.plan_id WHERE c.id=? AND p.run_id=?", (concept_id, run_id))
+        if not run or not concept or run["status"] == "RUNNING":
+            raise UserActionRequired("Нужен остановленный запуск и его утверждённая тема.")
+        settings, prompts = json.loads(run["settings_json"]), json.loads(run["prompts_json"])
+        if not native(prompts.get("RESEARCH"), "research"):
+            raise UserActionRequired("Локальная проверка поддерживает Research 1.0.")
+        prefix = f"run:{run_id}" + (f":analysis-v{settings['analysis_revision']}" if settings.get("analysis_revision") else "")
+        key = prefix + f":refresh:{concept_id}:v{concept['research_version']}"
+        receipt = store.one("SELECT * FROM ai_calls WHERE call_key=?", (key,))
+        if not receipt or receipt["status"] != "SUCCEEDED" or not receipt["result_json"]:
+            raise UserActionRequired("Нет успешной сохранённой квитанции Research этой версии темы.")
+        if store.one("SELECT article_id FROM article_details WHERE concept_id=?", (concept_id,)) or store.one(
+                "SELECT call_key FROM ai_calls WHERE call_key=? OR call_key LIKE ?", (prefix + f":write:{concept_id}", prefix + f":write:{concept_id}:%")):
+            raise UserActionRequired("Writer этой темы уже запускался. Его основание нельзя подменять локальным восстановлением.")
+        response = json.loads(receipt["result_json"])
+        require_complete_response(response)
+        result, validation = parse_research(response["choices"][0]["message"]["content"])
+        # Validate identity and approval before changing a saved dossier.
+        from dzen_agent.editorial_pipeline import approved_concept
+        service = ContentService(store, None, settings=settings, prompts=prompts, run_id=run_id)
+        approved = approved_concept(service, concept)
+        if (result.run_id, result.concept_id, result.concept_revision) != (run_id, approved["concept_id"], approved["revision"]):
+            raise UserActionRequired("Оплаченный Research относится к другой теме или редакции концепта.")
+
+        class SavedResponseOnly:
+            def call(self, **kwargs):
+                if (kwargs["call_key"], kwargs["operation"]) != (key, "RESEARCH"):
+                    raise AssertionError("Локальная проверка не может запускать другие AI-операции.")
+                return json.loads(receipt["result_json"])
+
+        directory = store.database_path.parent / "backups"
+        directory.mkdir(exist_ok=True)
+        backup = directory / f"{store.database_path.stem}-research-run{run_id}-{datetime.now(UTC):%Y%m%dT%H%M%S%f}.db"
+        with sqlite3.connect(store.database_path) as source, sqlite3.connect(backup) as destination:
+            source.backup(destination)
+        old_job = store.one("SELECT * FROM research_jobs WHERE id=?", (concept["research_id"],))
+        service.provider = SavedResponseOnly()
+        failure = None
+        try:
+            Pipeline(store, service.provider)._research_one(concept, {}, prefix, service)
+        except UserActionRequired as error:
+            failure = str(error)
+        job = store.one("SELECT * FROM research_jobs WHERE id=?", (concept["research_id"],))
+        enough = not failure and job["status"] == "sufficient"
+        fingerprint = item_fingerprint(store, concept, "RESEARCH")
+        with store._connect() as conn:
+            conn.execute("INSERT INTO pipeline_items(run_id,concept_id,stage,input_hash,status,error,attempts,updated_at) "
+                "VALUES(?,?,'RESEARCH',?,?,?,0,?) ON CONFLICT(run_id,concept_id,stage,input_hash) DO UPDATE "
+                "SET status=excluded.status,error=excluded.error,updated_at=excluded.updated_at",
+                (run_id, concept_id, fingerprint, "SUCCEEDED" if enough else "ERROR", failure, now_iso()))
+            remaining = conn.execute("SELECT 1 FROM concepts c JOIN content_plans p ON p.id=c.plan_id JOIN research_jobs r ON r.id=c.research_id "
+                                     "WHERE p.run_id=? AND (c.needs_research=1 OR r.status<>'sufficient')", (run_id,)).fetchone()
+            if enough and not remaining:
+                conn.execute("UPDATE pipeline_stages SET status='SUCCEEDED',error=NULL,ended_at=? WHERE run_id=? AND stage IN ('RESEARCH','REFRESH_RESEARCH')", (now_iso(), run_id))
+            if enough:
+                conn.execute("UPDATE pipeline_stages SET status='PENDING',error=NULL WHERE run_id=? AND stage IN ('WRITE','IMAGE','QA','REVIEW') AND status<>'SUCCEEDED'", (run_id,))
+            conn.execute("UPDATE pipeline_runs SET status=?,error=?,ended_at=? WHERE id=?",
+                         ("RESEARCH_READY" if enough and not remaining else "NEEDS_ACTION", failure, now_iso(), run_id))
+        report = {"run_id": run_id, "concept_id": concept_id, "call_key": key, "backup_path": str(backup),
+                  "restored": enough, "sufficient_for_writer": enough, "facts": len(result.facts),
+                  "approved_facts": len(result.writer_handoff.approved_fact_ids), "sources": len(result.sources),
+                  "timeline_events": len(result.timeline), "validation": validation, "error": failure,
+                  "next_paid_stages_started": False}
+        store.log("RESEARCH_REPLAY", "Бесплатная проверка оплаченного Research; следующие этапы не запускались",
+                  {**report, "previous_research_job": old_job, "previous_concept": concept})
+        return report
+
+
 def reprocess_discovery(store, run_id: int):
     """Replay only a successful saved Discovery receipt. No API client or pipeline is started."""
     import json

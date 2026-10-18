@@ -189,15 +189,23 @@ class ContentService:
         require_complete_response(response)
         try:
             content = response["choices"][0]["message"]["content"]
-            from dzen_agent.editorial_contracts import DiscoveryV1
+            from dzen_agent.editorial_contracts import DiscoveryV1, ResearchV1
             if schema is DiscoveryV1:
                 from dzen_agent.discovery_validation import parse_discovery
                 result, issues = parse_discovery(content)
                 response = {**response, "discovery_validation": issues}
+            elif schema is ResearchV1:
+                from dzen_agent.research_validation import parse_research
+                result, report = parse_research(content)
+                response = {**response, "research_validation": report}
             else:
                 result = schema.model_validate_json(content)
         except (KeyError, IndexError, TypeError, ValueError) as error:
             details = ""
+            from dzen_agent.research_validation import ResearchReferenceError
+            if isinstance(error, ResearchReferenceError):
+                details = " Ошибки ссылок: " + str(error)
+                self.store.log("RESEARCH_VALIDATION", "Ошибки ссылок оплаченного ответа", {"call_key": call_key, "issues": error.issues})
             if isinstance(error, ValidationError):
                 details = " Ошибки: " + "; ".join(
                     f"{'.'.join(map(str, e['loc'])) or 'JSON'}: {e['type']} ({e['msg']})"

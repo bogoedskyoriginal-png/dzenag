@@ -11,7 +11,7 @@ from dzen_agent.editorial_pipeline import preflight
 from dzen_agent.locking import exclusive_lock
 from dzen_agent.pipeline.orchestrator import create_run, estimate_operations, next_week, stages_for
 from dzen_agent.prompt_service import Prompts
-from dzen_agent.recovery import authorize_retry, reprocess_discovery
+from dzen_agent.recovery import authorize_retry, reprocess_discovery, reprocess_research
 from dzen_agent.services import week_slots
 from dzen_agent.store import MSK
 
@@ -24,6 +24,7 @@ STATUS = {"PENDING": "Ожидает", "RUNNING": "В работе", "ERROR": "�
     "BLOCKED": "Ожидает предыдущий этап",
     "WAITING": "Ожидает редактора", "NEEDS_ACTION": "Нужна помощь", "STOPPED": "Приостановлено",
     "ANALYTICS_READY": "Аналитика готова", "PLAN_APPROVED": "Темы утверждены", "APPROVED": "Материалы утверждены",
+    "RESEARCH_READY": "Исследование восстановлено",
     "AWAITING_PLAN_REVIEW": "Проверьте темы", "AWAITING_REVIEW": "Материалы на проверке",
     "AWAITING_SEND": "Ожидает передачи в Дзен", "PLANNED": "В плане", "PUBLISHED": "Опубликовано",
     "WRITTEN": "Текст готов", "IMAGE_READY": "Оформлено", "READY_FOR_REVIEW": "Готово к проверке",
@@ -270,6 +271,28 @@ def recovery_panel(store, config, run, stage):
                 if action("Проверяю оплаченный ответ локально…", lambda: reprocess_discovery(store, run["id"]),
                           success="Ответ обработан. Planner не запускался."):
                     st.rerun()
+        elif stage["stage"] in ("RESEARCH", "REFRESH_RESEARCH") and selected is not None:
+            st.caption("Бесплатная проверка изолирует неподтверждённые элементы. Writer, Image и другие AI-этапы не запускаются.")
+            from dzen_agent.research_validation import parse_research, ResearchReferenceError
+            with st.expander("Диагностика ссылок сохранённого Research"):
+                try:
+                    _, diagnosis = parse_research(json.loads(receipt["result_json"])["choices"][0]["message"]["content"])
+                    issues = diagnosis["issues"]
+                except ResearchReferenceError as error:
+                    issues = error.issues
+                except (ValueError, KeyError, TypeError, IndexError) as error:
+                    issues = []
+                    st.warning(str(error))
+                if issues:
+                    st.dataframe([{"Поле": ".".join(map(str, i["path"])), "Получено": str(i["actual"]),
+                                   "Объявленные ID": ", ".join(i["expected"])} for i in issues], hide_index=True)
+                else:
+                    st.caption("Неизвестных ссылочных ID не обнаружено.")
+            if st.button("Проверить сохранённый Research бесплатно", key=f"research-replay-{run['id']}-{selected}"):
+                report = action("Проверяю сохранённое досье…", lambda: reprocess_research(store, run["id"], selected),
+                                success="Локальная проверка завершена. Платные этапы не запускались.")
+                if report:
+                    st.rerun()
         else:
             st.caption("Если ответ пройдёт проверку, подготовка продолжится на следующих платных этапах.")
             if st.button("Продолжить с сохранённым ответом", disabled=not config.aitunnel_api_key, key=f"replay-{run['id']}"):
@@ -397,6 +420,9 @@ def run_card(store, config, run_id):
             else:
                 st.caption("Продолжение использует готовые результаты. Последующие AI-этапы оплачиваются до проверки плана редактором.")
                 label = "Продолжить поиск тем" if stage["stage"] == "DISCOVERY" else "Продолжить подготовку"
+                if run["status"] == "RESEARCH_READY":
+                    st.info("Сохранённый Research восстановлен локально. Аналитика, Discovery, Planner и Research повторяться не будут.")
+                    label = "Продолжить с Writer (платно)"
                 if st.button(label, type="primary", disabled=not config.aitunnel_api_key, key=f"resume-{run_id}"):
                     if queue_run(store, run_id):
                         st.rerun()
@@ -426,6 +452,15 @@ def run_card(store, config, run_id):
                 st.dataframe([{"Тема": i["topic"], "Этап": STAGES[i["stage"]], "Статус": human_status(i["status"]),
                                "Что исправить": i["error"] or ""} for i in latest.values()], hide_index=True)
                 st.caption("Продолжение обрабатывает незавершённые статьи. Готовые AI-ответы используются повторно без оплаты.")
+        for replay in store.rows("SELECT details_json FROM event_log WHERE stage='RESEARCH_REPLAY' ORDER BY id DESC LIMIT 20"):
+            report = json.loads(replay["details_json"])
+            if report.get("run_id") == run_id:
+                with st.expander("Результат локальной проверки Research"):
+                    st.write(f"Фактов для Writer: {report['approved_facts']}; источников: {report['sources']}; "
+                             f"изолированных элементов: {len(report['validation']['quarantined'])}.")
+                    st.write("Достаточно для Writer по контракту." if report["sufficient_for_writer"] else "Досье требует дополнительной редакционной проверки.")
+                    st.json(report["validation"], expanded=False)
+                break
 
 
 def discovery_supply_panel(store, config, run_id):

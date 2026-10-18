@@ -280,6 +280,9 @@ def research(service, row, call_key):
             "search_depth": "deep", "max_sources": 12, "preferred_domains": [], "excluded_domains": [],
             "additional_requirements": []}}
     result, response = service.structured("RESEARCH", ResearchV1, context, call_key)
+    if response.get("research_validation"):
+        service.store.log("RESEARCH_VALIDATION", "Локальная проверка ссылок Research; оплаченный ответ сохранён без изменений",
+                          {"run_id": service.run_id, "concept_id": row["id"], "call_key": call_key, **response["research_validation"]})
     validate_run(result, service)
     if (result.concept_id, result.concept_revision) != (concept["concept_id"], concept["revision"]):
         raise ValueError("Research изменил идентификатор или версию утверждённого концепта.")
