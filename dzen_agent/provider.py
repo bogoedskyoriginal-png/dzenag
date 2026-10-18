@@ -145,7 +145,7 @@ class AITunnel:
 
     def call(self, *, call_key: str, operation: str, model: str, payload: dict,
              run_id: int | None = None, article_id: int | None = None,
-             image_path: Path | None = None) -> dict:
+             image_path: Path | None = None, retry_limit: int | None = None) -> dict:
         with exclusive_lock(self.store.database_path.parent / "ai.lock"):
             previous = self.store.one("SELECT * FROM ai_calls WHERE call_key=?", (call_key,))
             if previous:
@@ -169,6 +169,8 @@ class AITunnel:
                             + (previous["error"] or ""))
             self.guard()
             retries = min(3, max(0, int(self.store.settings()["max_retries"])))
+            if retry_limit is not None:
+                retries = min(retries, max(0, retry_limit))
             for attempt in range(retries + 1):
                 self.store.execute(
                     "INSERT INTO ai_calls(call_key,status,created_at,updated_at) VALUES(?,?,?,?) "

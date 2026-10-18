@@ -119,17 +119,22 @@ def test_title_change_reuses_research_and_writer_refuses_stale_data(editorial_pl
         ContentService(store, api).write(row["topic"], row["research_id"], "test", concept_row=row)
 
 
-def test_insufficient_refresh_never_reaches_writer(editorial_plan):
+def test_insufficient_refresh_blocks_only_affected_writer(editorial_plan):
     store, run_id, plan_id, ids = editorial_plan
     store.execute("UPDATE concepts SET needs_research=1,research_version=1 WHERE id=?", (ids[0],))
     approve_plan(store, plan_id)
 
+    written = []
     class NoResearch(ContentService):
         def research(self, *args, **kwargs):
             return self.store.execute("INSERT INTO research_jobs(run_id,topic,status,payload_json,created_at) "
                                       "VALUES(?,'failed','insufficient_research','{}',?)", (run_id, now_iso()))
         def write(self, *args, **kwargs):
-            pytest.fail("Writer must not run")
+            concept_id = kwargs["concept_row"]["id"]
+            assert concept_id != ids[0], "Failed Research must never reach Writer"
+            written.append(concept_id)
+            raise UserActionRequired("Mock Writer: no paid transport")
 
     assert Pipeline(store, None, service_factory=NoResearch).execute(run_id) == "NEEDS_ACTION"
     assert store.one("SELECT needs_research FROM concepts WHERE id=?", (ids[0],))["needs_research"] == 1
+    assert written == [ids[1]]

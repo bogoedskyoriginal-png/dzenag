@@ -69,6 +69,12 @@ def request(self, method, path, **kwargs):
             run_id = context.get("run_context", {}).get("run_id", 1)
             prefix = {2: "Архивы киномузея: ", 3: "Практика монтажной мастерской: "}.get(run_id, "")
             fixture.TOPICS = [prefix + topic for topic in base_topics]
+            if run_id >= 4:
+                fixture.TOPICS = base_topics[5:] + base_topics[:5]
+            if context.get("additional_search"):
+                fixture.TOPICS = base_topics[10:] + base_topics[:10]
+                context["editorial_config"]["target_article_count"] = context["additional_search"]["missing_count"]
+                payload["messages"][1]["content"] = dumps(context)
         except ValueError:
             pass
     req = httpx.Request(method, "https://mock.invalid" + path, json=payload)
@@ -84,6 +90,13 @@ def request(self, method, path, **kwargs):
         response = httpx.Response(200, json={"choices": [{"message": {"content": dumps(reply)}}], "usage": {"cost_rub": .05}})
     else:
         response = api.handler(req)
+        if current_flags.get("partial_discovery") and payload.get("model") == "discovery-test" and not context.get("additional_search"):
+            data = response.json()
+            result = json.loads(data["choices"][0]["message"]["content"])
+            for candidate in result["candidates"][1:]:
+                candidate["viability_status"] = "needs_validation"
+            data["choices"][0]["message"]["content"] = dumps(result)
+            response = httpx.Response(200, json=data)
     response.request = req
     response.raise_for_status()
     return response

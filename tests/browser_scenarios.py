@@ -196,6 +196,46 @@ def main():
             page.get_by_role("button", name="Проверить контент-план", exact=True).wait_for()
             assert len(store.rows("SELECT id FROM usage_events WHERE operation='ANALYTICS'")) == calls
             check("error recovery consent and no repeated Analytics")
+            flags.write_text(dumps({"partial_discovery": True}), encoding="utf-8")
+            start("2030-02-04", 2)
+            page.get_by_text("Найти только недостающие идеи", exact=True).click()
+            page.get_by_role("button", name="Разрешить дозаполнение и продолжить", exact=True).wait_for()
+            assert page.get_by_role("button", name="Разрешить дозаполнение и продолжить", exact=True).is_disabled()
+            assert not store.rows("SELECT * FROM discovery_requests")
+            page.screenshot(path=str(directory / "discovery-shortfall.png"), full_page=True)
+            check("partial Discovery retained and extra spend requires consent")
+            page.get_by_text("Разрешаю дополнительные платные поиски в этих пределах", exact=True).click()
+            page.get_by_role("button", name="Разрешить дозаполнение и продолжить", exact=True).click()
+            page.get_by_role("button", name="Проверить контент-план", exact=True).wait_for(timeout=30000)
+            assert len(store.rows("SELECT * FROM discovery_requests")) == 1
+            assert store.one("SELECT status FROM discovery_requests")["status"] == "DONE"
+            check("authorized incremental Discovery automatically continues to Planner")
+            start("2030-02-11", 2)
+            page.get_by_text("Подготовить меньший план без нового поиска", exact=True).click()
+            paid_discovery = len(store.rows("SELECT id FROM usage_events WHERE operation='DISCOVERY'"))
+            page.get_by_role("button", name="Сократить до 1 и продолжить Planner (платно)", exact=True).click()
+            page.get_by_role("button", name="Проверить контент-план", exact=True).wait_for()
+            assert len(store.rows("SELECT id FROM usage_events WHERE operation='DISCOVERY'")) == paid_discovery
+            assert len(store.rows("SELECT * FROM concepts WHERE plan_id=5")) == 1
+            check("smaller plan recomputes slots without repeated Sonar")
+            flags.write_text(dumps({"fail_research": "P001"}), encoding="utf-8")
+            nav("Рабочий стол")
+            # Return to the two-concept week and approve it; one Research fails in the mock.
+            options = store.rows("SELECT id FROM pipeline_runs ORDER BY id")
+            assert len(options) == 5
+            page.get_by_test_id("stSelectbox").filter(has=page.get_by_text("Рабочая неделя", exact=True)).get_by_role("combobox").click()
+            page.get_by_role("option").filter(has_text="04.02").click()
+            page.get_by_role("button", name="Проверить контент-план", exact=True).click()
+            page.get_by_role("button", name="Утвердить контент-план и продолжить", exact=True).click()
+            wait_db(lambda: store.one("SELECT status FROM pipeline_runs WHERE id=4")["status"] == "NEEDS_ACTION")
+            page.get_by_role("button", name="Посмотреть подготовку материалов", exact=True).click()
+            page.get_by_text("Готовность отдельных статей", exact=True).wait_for()
+            assert len(store.rows("SELECT * FROM pipeline_items WHERE run_id=4 AND stage='QA' AND status='SUCCEEDED'")) == 1
+            page.get_by_role("button", name="Разобраться с ошибкой", exact=True).click()
+            page.get_by_role("button", name="Повторить этап и продолжить (платно)", exact=True).wait_for()
+            assert page.get_by_role("button", name="Повторить этап и продолжить (платно)", exact=True).is_disabled()
+            page.screenshot(path=str(directory / "independent-article-status.png"), full_page=True)
+            check("failed article isolated while another reaches QA; retry consent remains required")
             flags.write_text(dumps({"simulate_running": True}), encoding="utf-8")
             start("2030-01-28", 1)
             page.get_by_text("Агент работает.", exact=False).wait_for()
@@ -215,7 +255,8 @@ def main():
             check("Windows automation separate from publication slots")
             for width in (1366, 1920, 768):
                 page.set_viewport_size({"width": width, "height": 900})
-                nav("Рабочий стол")
+                if not page.get_by_role("heading", name="Рабочий стол", exact=True).is_visible():
+                    nav("Рабочий стол")
                 overflow = page.evaluate("document.documentElement.scrollWidth > window.innerWidth + 2")
                 assert not overflow, f"Overflow at {width}"
                 check(f"layout {width}px")

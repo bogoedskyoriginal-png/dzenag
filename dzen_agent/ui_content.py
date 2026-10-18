@@ -32,7 +32,9 @@ def content_plan(store, config):
     selected_run = st.session_state.pop("selected_plan_run", None)
     ids = [p["id"] for p in plans]
     chosen = next((p["id"] for p in plans if p["run_id"] == selected_run), ids[0])
-    plan_id = st.selectbox("Неделя плана", ids, index=ids.index(chosen), format_func=lambda i:
+    if selected_run is not None or st.session_state.get("plan_week_selection") not in ids:
+        st.session_state.plan_week_selection = chosen
+    plan_id = st.selectbox("Неделя плана", ids, key="plan_week_selection", format_func=lambda i:
         next(week_label(p["week_start"]) for p in plans if p["id"] == i))
     plan = next(p for p in plans if p["id"] == plan_id)
     rows = store.rows("SELECT c.*,r.status AS research_status,d.article_id FROM concepts c "

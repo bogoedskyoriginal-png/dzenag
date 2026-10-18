@@ -32,6 +32,7 @@ DEFAULTS = {
     "writer_model": "", "image_model": "", "dzen_statistics_url": "",
     "image_quality": "low", "dzen_adapter_verified": False,
     "dzen_editor_url": "",
+    "discovery_topup_budget_rub": 10.0, "discovery_topup_max_calls": 2, "discovery_topup_reserve_rub": 5.0,
 }
 
 

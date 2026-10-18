@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS articles (
  id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, title TEXT NOT NULL,
@@ -149,6 +149,31 @@ CREATE TABLE visual_results (
 """
 
 
+RESILIENCE_SCHEMA = """
+CREATE TABLE discovery_batches (
+ id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES pipeline_runs(id),
+ analysis_revision INTEGER NOT NULL, call_key TEXT NOT NULL UNIQUE,
+ payload_json TEXT NOT NULL, context_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE discovery_topups (
+ run_id INTEGER NOT NULL REFERENCES pipeline_runs(id), analysis_revision INTEGER NOT NULL,
+ budget_rub REAL NOT NULL, max_calls INTEGER NOT NULL, reserve_rub REAL NOT NULL,
+ authorized_at TEXT NOT NULL, PRIMARY KEY(run_id,analysis_revision)
+);
+CREATE TABLE discovery_requests (
+ call_key TEXT PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES pipeline_runs(id),
+ analysis_revision INTEGER NOT NULL, status TEXT NOT NULL, reserved_rub REAL NOT NULL,
+ cost_rub REAL, context_json TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE pipeline_items (
+ id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES pipeline_runs(id),
+ concept_id INTEGER NOT NULL REFERENCES concepts(id), stage TEXT NOT NULL, input_hash TEXT NOT NULL,
+ status TEXT NOT NULL, article_id INTEGER REFERENCES articles(id), attempts INTEGER NOT NULL DEFAULT 0,
+ error TEXT, updated_at TEXT NOT NULL, UNIQUE(run_id,concept_id,stage,input_hash)
+);
+"""
+
+
 def migrate(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path, timeout=30) as conn:
@@ -168,7 +193,7 @@ def migrate(path: Path) -> None:
         try:
             # Another process may have migrated while we acquired the write lock.
             current = conn.execute("PRAGMA user_version").fetchone()[0]
-            for target, script in ((1, SCHEMA), (2, EDITORIAL_SCHEMA), (3, ANALYTICS_SCHEMA), (4, VISUAL_SCHEMA)):
+            for target, script in ((1, SCHEMA), (2, EDITORIAL_SCHEMA), (3, ANALYTICS_SCHEMA), (4, VISUAL_SCHEMA), (5, RESILIENCE_SCHEMA)):
                 if current < target:
                     for statement in script.split(";"):
                         if statement.strip():

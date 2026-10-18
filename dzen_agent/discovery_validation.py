@@ -2,11 +2,67 @@
 from __future__ import annotations
 
 import json
+import copy
 from collections import Counter
 
 from pydantic import ValidationError
 
 from dzen_agent.editorial_contracts import DiscoveryV1, Idea, RejectedIdea
+
+
+def repair_candidate(candidate, index):
+    """Only representation changes: no missing sources/facts, fuzzy matching or ID guessing."""
+    value, changes = copy.deepcopy(candidate), []
+    if not isinstance(value, dict):
+        return value, changes
+    def change(container, key, new, path):
+        old = container[key]
+        if old != new:
+            container[key] = new
+            changes.append({"type": "technical_repair", "loc": ["candidates", index, *path],
+                            "message": "Однозначная техническая нормализация", "before": old, "after": new})
+    for field in ("sources", "anchor_facts"):
+        if isinstance(value.get(field), dict):
+            change(value, field, [value[field]], [field])
+    sources = value.get("sources", [])
+    if not isinstance(sources, list):
+        return value, changes
+    ids = [s.get("source_id") for s in sources if isinstance(s, dict) and isinstance(s.get("source_id"), str)]
+    trimmed = [s.strip() for s in ids]
+    if all(trimmed) and len(set(trimmed)) == len(trimmed):
+        for n, source in enumerate(sources):
+            if isinstance(source, dict) and isinstance(source.get("source_id"), str):
+                change(source, "source_id", source["source_id"].strip(), ["sources", n, "source_id"])
+        ids = trimmed
+    lookup = {}
+    for source_id in ids:
+        lookup.setdefault(source_id.strip().casefold(), []).append(source_id)
+    entries = [("anchor_facts", value.get("anchor_facts", []))]
+    selection = value.get("selection_feasibility")
+    if isinstance(selection, dict):
+        entries.append(("selection_feasibility.verified_subjects", selection.get("verified_subjects", [])))
+    for field, items in entries:
+        if not isinstance(items, list):
+            continue
+        for n, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            path = [*field.split("."), n, "source_ids"]
+            if isinstance(item.get("source_ids"), str):
+                change(item, "source_ids", [item["source_ids"]], path)
+            references = item.get("source_ids")
+            if not isinstance(references, list):
+                continue
+            for position, reference in enumerate(references):
+                matches = lookup.get(reference.strip().casefold(), []) if isinstance(reference, str) else []
+                if reference not in ids and len(matches) == 1:
+                    change(references, position, matches[0], [*path, position])
+    scores = value.get("scores")
+    if isinstance(scores, dict):
+        for field, score in list(scores.items()):
+            if isinstance(score, str) and score.strip() in {str(n) for n in range(6)}:
+                change(scores, field, int(score), ["scores", field])
+    return value, changes
 
 
 def candidate_errors(candidate, error, index):
@@ -51,6 +107,8 @@ def parse_discovery(content):
                      if isinstance(c, dict) and isinstance(c.get("idea_id"), str))
     issues = []
     for index, candidate in enumerate(raw["candidates"]):
+        candidate, changes = repair_candidate(candidate, index)
+        issues.extend(changes)
         try:
             idea = Idea.model_validate(candidate)
         except ValidationError as error:

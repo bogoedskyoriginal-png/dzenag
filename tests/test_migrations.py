@@ -1,6 +1,6 @@
 import sqlite3
 
-from dzen_agent.migrations import EDITORIAL_SCHEMA, SCHEMA
+from dzen_agent.migrations import EDITORIAL_SCHEMA, SCHEMA, SCHEMA_VERSION
 from dzen_agent.store import Store
 
 
@@ -42,7 +42,7 @@ def test_v1_editorial_migration_keeps_existing_plan_and_articles(tmp_path):
     assert len(store.rows("SELECT * FROM pipeline_stages WHERE stage IN ('PLAN_REVIEW','REFRESH_RESEARCH')")) == 2
     assert all(row["status"] == "SUCCEEDED" for row in store.rows("SELECT status FROM pipeline_stages"))
     assert len(list((tmp_path / "backups").glob('*.db'))) == 1
-    assert store.one("PRAGMA user_version")["user_version"] == 4
+    assert store.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION
     assert store.one("PRAGMA foreign_key_check") is None
     store.execute("INSERT INTO editorial_chat_messages(plan_id,role,content,created_at) VALUES(9,'user','Сохранено','now')")
     reopened = Store(path)
@@ -69,6 +69,28 @@ def test_v2_to_v3_keeps_raw_analytics_prompt_and_run_snapshot(tmp_path):
     assert store.rows("SELECT * FROM prompt_versions") == before
     assert store.one("SELECT payload_json,superseded FROM analytics_results") == {"payload_json": original, "superseded": 0}
     assert store.one("SELECT settings_json FROM pipeline_runs")["settings_json"] == "{}"
-    assert store.one("PRAGMA user_version")["user_version"] == 4
+    assert store.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION
     assert store.one("PRAGMA integrity_check")["integrity_check"] == "ok"
     assert len(list((tmp_path / "backups").glob('*.db'))) == 1
+
+
+def test_v4_resilience_migration_preserves_receipts_and_user_data(tmp_path):
+    from dzen_agent.migrations import ANALYTICS_SCHEMA, VISUAL_SCHEMA
+    path = tmp_path / "v4.db"
+    with sqlite3.connect(path) as conn:
+        for schema in (SCHEMA, EDITORIAL_SCHEMA, ANALYTICS_SCHEMA, VISUAL_SCHEMA):
+            conn.executescript(schema)
+        conn.execute("PRAGMA user_version=4")
+        conn.execute("INSERT INTO articles VALUES(42,'topic','title','untouched body','DRAFT','now','now')")
+        conn.execute("INSERT INTO ai_calls(call_key,status,result_json,created_at,updated_at) VALUES('paid','SUCCEEDED','{\"raw\":true}','now','now')")
+        conn.execute("INSERT INTO usage_events(timestamp,operation,model,cost_rub,success,call_key) VALUES('now','DISCOVERY','sonar',6,1,'paid')")
+    store = Store(path)
+    tables = ("articles", "ai_calls", "usage_events")
+    before = {t: store.rows(f"SELECT * FROM {t}") for t in tables}
+    store.initialize()
+    store.initialize()
+    assert {t: store.rows(f"SELECT * FROM {t}") for t in tables} == before
+    assert store.one("PRAGMA user_version")["user_version"] == SCHEMA_VERSION
+    assert store.one("PRAGMA integrity_check")["integrity_check"] == "ok"
+    assert len(list((tmp_path / "backups").glob('*v4-*.db'))) == 1
+    assert store.rows("SELECT * FROM pipeline_items") == []

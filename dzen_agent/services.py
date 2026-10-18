@@ -183,6 +183,7 @@ class ContentService:
         response = self.provider.call(
             call_key=call_key, operation=operation or {"WRITER": "WRITE", "PLANNER": "PLANNING"}
             .get(kind, kind), model=model, payload=payload, run_id=self.run_id, article_id=article_id,
+            **({"retry_limit": 0} if ":discovery:topup:" in call_key else {}),
         )
         from dzen_agent.ai_response import require_complete_response
         require_complete_response(response)
@@ -226,12 +227,14 @@ class ContentService:
             "VALUES(?,?,?,?,?)", (statistics_id, self.run_id, result.model_dump_json(),
                                   self.prompts["ANALYTICS"]["id"], now_iso()))
 
-    def discover(self, analytics: dict, call_key: str) -> int:
+    def discover(self, analytics: dict, call_key: str, *, additional=None) -> int:
         parsed = parse_analytics(analytics)
         if isinstance(parsed, Analytics) and parsed.status == "insufficient_data":
             raise UserActionRequired("Analytics: недостаточно данных. Исправьте импорт перед платным Discovery.")
         if editorial_pipeline.native(self.prompts.get("DISCOVERY"), "discovery"):
-            return editorial_pipeline.discover(self, analytics, call_key)
+            return editorial_pipeline.discover(self, analytics, call_key, additional=additional)
+        if additional:
+            raise UserActionRequired("Дозаполнение поддерживает только Discovery 1.0.")
         existing = self.store.one("SELECT * FROM discovery_results WHERE run_id=?", (self.run_id,))
         revision = int(self.settings.get("analysis_revision", 0))
         if existing and existing["analysis_revision"] == revision:
@@ -642,6 +645,18 @@ def qa_article(store: Store, article_id: int) -> dict:
         done = {s["stage"] for s in stages if s["status"] == "SUCCEEDED"}
         missing = {"COLLECT_STATS", "ANALYZE", "RESEARCH", "PLAN", "PLAN_REVIEW", "REFRESH_RESEARCH",
                    "WRITE", "IMAGE"} - done
+        # Other articles' failures cannot invalidate this article's completed stages.
+        concept = store.one("SELECT * FROM concepts WHERE id=?", (detail.get("concept_id"),))
+        if concept and not concept["needs_research"]:
+            from dzen_agent.pipeline.items import item_fingerprint
+            for stage in ("RESEARCH", "WRITE", "IMAGE"):
+                fingerprint = item_fingerprint(store, concept, stage, article_id if stage == "IMAGE" else None)
+                item = store.one("SELECT status FROM pipeline_items WHERE run_id=? AND concept_id=? AND stage=? AND input_hash=?",
+                                 (detail["run_id"], concept["id"], stage, fingerprint))
+                if item and item["status"] == "SUCCEEDED":
+                    missing.discard(stage)
+                    if stage == "RESEARCH":
+                        missing.discard("REFRESH_RESEARCH")
         run = store.one("SELECT settings_json FROM pipeline_runs WHERE id=?", (detail["run_id"],))
         if run and json.loads(run["settings_json"]).get("pipeline_flow") == "analytics_v1" and "DISCOVERY" not in done:
             missing.add("DISCOVERY")

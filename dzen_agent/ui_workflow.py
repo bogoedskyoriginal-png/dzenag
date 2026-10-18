@@ -21,6 +21,7 @@ STAGES = {"COLLECT_STATS": "Подготовка статистики", "ANALYZE
     "QA": "Проверка качества", "REVIEW": "Просмотр материалов", "DZEN_SCHEDULE": "Передача в Дзен", "VERIFY": "Проверка в Дзене"}
 MODES = {"REVIEW": "С проверкой редактора", "MANUAL": "Ручное управление", "AUTOPILOT": "Автономный режим"}
 STATUS = {"PENDING": "Ожидает", "RUNNING": "В работе", "ERROR": "Нужна помощь", "SUCCEEDED": "Готово",
+    "BLOCKED": "Ожидает предыдущий этап",
     "WAITING": "Ожидает редактора", "NEEDS_ACTION": "Нужна помощь", "STOPPED": "Приостановлено",
     "ANALYTICS_READY": "Аналитика готова", "PLAN_APPROVED": "Темы утверждены", "APPROVED": "Материалы утверждены",
     "AWAITING_PLAN_REVIEW": "Проверьте темы", "AWAITING_REVIEW": "Материалы на проверке",
@@ -61,10 +62,10 @@ def current_stage(store, run):
     return next((r for r in rows if r["status"] != "SUCCEEDED"), rows[-1] if rows else None)
 
 
-def failed_receipt(store, run, stage):
+def failed_receipt(store, run, stage, concept_id=None):
     operations = {"ANALYZE": ["ANALYTICS"], "DISCOVERY": ["DISCOVERY"], "PLAN": ["PLANNING"],
         "RESEARCH": ["RESEARCH"], "REFRESH_RESEARCH": ["RESEARCH"], "WRITE": ["WRITE"],
-        "IMAGE": ["IMAGE", "IMAGE_SEARCH", "IMAGE_INSPECT"], "QA": ["QA"]}.get(stage, [])
+        "IMAGE": ["IMAGE", "IMAGE_SEARCH", "IMAGE_INSPECT"], "QA": ["QA", "OTHER"]}.get(stage, [])
     revision = json.loads(run["settings_json"]).get("analysis_revision", 0)
     prefix = f"run:{run['id']}" + (f":analysis-v{revision}" if revision else "")
     suffix = {"ANALYZE": ":analytics", "DISCOVERY": ":discovery", "PLAN": ":plan"}.get(stage)
@@ -73,6 +74,17 @@ def failed_receipt(store, run, stage):
     rows = store.rows("SELECT a.*,u.operation FROM ai_calls a LEFT JOIN usage_events u ON a.call_key=u.call_key "
         "WHERE a.call_key LIKE ? AND a.call_key NOT LIKE '%:archived:%' ORDER BY a.updated_at DESC", (prefix + ":%",))
     matching = [r for r in rows if r.get("operation") in operations]
+    item_stage = "RESEARCH" if stage == "REFRESH_RESEARCH" else stage
+    items = store.rows("SELECT * FROM pipeline_items WHERE run_id=? AND stage=? ORDER BY updated_at,id", (run["id"], item_stage))
+    latest = {i["concept_id"]: i for i in items}
+    failed = [i for i in latest.values() if i["status"] == "ERROR" and (concept_id is None or concept_id == i["concept_id"])]
+    if items:
+        def belongs(receipt, item):
+            suffix = {"RESEARCH": f":refresh:{item['concept_id']}:v", "WRITE": f":write:{item['concept_id']}",
+                      "IMAGE": f":image:{item['article_id']}", "QA": f":qa:{item['article_id']}:"}.get(item_stage)
+            return suffix and (receipt["call_key"] == prefix + suffix or receipt["call_key"].startswith(prefix + suffix + ":")
+                               or (item_stage in ("RESEARCH", "QA") and receipt["call_key"].startswith(prefix + suffix)))
+        matching = [r for r in matching if any(belongs(r, i) for i in failed)]
     return next((r for r in matching if r["status"] != "SUCCEEDED"), matching[0] if matching else None)
 
 
@@ -233,7 +245,14 @@ def wizard(store, config):
 
 def recovery_panel(store, config, run, stage):
     from dzen_agent.ui_pages import action, rub
-    receipt = failed_receipt(store, run, stage["stage"])
+    item_stage = "RESEARCH" if stage["stage"] == "REFRESH_RESEARCH" else stage["stage"]
+    items = store.rows("SELECT i.*,c.topic FROM pipeline_items i JOIN concepts c ON c.id=i.concept_id "
+                       "WHERE i.run_id=? AND i.stage=? ORDER BY i.updated_at,i.id", (run["id"], item_stage))
+    latest = {i["concept_id"]: i for i in items}
+    failed = {i["concept_id"]: i for i in latest.values() if i["status"] == "ERROR"}
+    selected = st.selectbox("Проблемная статья", list(failed), format_func=lambda cid: failed[cid]["topic"],
+                            key=f"recover-concept-{run['id']}-{item_stage}") if failed else None
+    receipt = failed_receipt(store, run, stage["stage"], selected)
     st.write(error_explanation(run, stage, receipt))
     st.caption(f"Расходы запуска: {rub(store.costs(run_id=run['id'])['total'])}. Сохранённые ответы остаются в истории.")
     if not receipt:
@@ -363,6 +382,7 @@ def run_card(store, config, run_id):
                     for i in candidates], hide_index=True)
                 if ready_count < target:
                     st.warning("Для полного плана не хватает подтверждённых идей. Платный Planner заблокирован; непроверенные темы не подставляются.")
+                    discovery_supply_panel(store, config, run_id)
                 elif st.button("Перейти к планированию (платно)", disabled=not config.aitunnel_api_key, key=f"plan-paid-{run_id}"):
                     queue_run(store, run_id)
                     st.rerun()
@@ -398,6 +418,58 @@ def run_card(store, config, run_id):
         cols[2].write("**" + (STAGES.get(stage["stage"], "Завершено") if stage else "Нет этапов") + "**")
         with st.expander("Ход подготовки", expanded=True):
             stage_timeline(store, run)
+        items = store.rows("SELECT c.topic,i.* FROM pipeline_items i JOIN concepts c ON c.id=i.concept_id "
+                           "WHERE i.run_id=? ORDER BY i.updated_at,i.id", (run_id,))
+        if items:
+            latest = {(i["concept_id"], i["stage"]): i for i in items}
+            with st.expander("Готовность отдельных статей", expanded=run["status"] == "NEEDS_ACTION"):
+                st.dataframe([{"Тема": i["topic"], "Этап": STAGES[i["stage"]], "Статус": human_status(i["status"]),
+                               "Что исправить": i["error"] or ""} for i in latest.values()], hide_index=True)
+                st.caption("Продолжение обрабатывает незавершённые статьи. Готовые AI-ответы используются повторно без оплаты.")
+
+
+def discovery_supply_panel(store, config, run_id):
+    from dzen_agent.discovery_supply import authorize_topup, reduce_plan, supply_status
+    status = supply_status(store, run_id)
+    run_error = store.one("SELECT error FROM pipeline_runs WHERE id=?", (run_id,))["error"]
+    if run_error:
+        st.caption(run_error)
+    if status["grant"]:
+        st.caption(f"Дозаполнение: расходы {status['committed_rub']:.2f} ₽ / {status['grant']['budget_rub']:.2f} ₽; "
+                   f"запросы {len(status['requests'])} / {status['grant']['max_calls']}.")
+        if st.button("Продолжить в пределах разрешённого бюджета", key=f"topup-resume-{run_id}", disabled=not config.aitunnel_api_key):
+            queue_run(store, run_id)
+            st.rerun()
+    with st.expander("Найти только недостающие идеи"):
+        defaults = store.settings()
+        budget = st.number_input("Дополнительный бюджет, ₽", min_value=0.1, value=float(defaults["discovery_topup_budget_rub"]), key=f"topup-budget-{run_id}")
+        calls = st.number_input("Максимум дополнительных запросов", min_value=1, max_value=5, value=int(defaults["discovery_topup_max_calls"]), key=f"topup-calls-{run_id}")
+        reserve = st.number_input("Резерв на один запрос, ₽", min_value=0.1, value=float(defaults["discovery_topup_reserve_rub"]), key=f"topup-reserve-{run_id}")
+        st.caption("Перед запросом резервируется сумма. Фактическая цена определяется AITUNNEL и может отличаться. "
+                   "При превышении резерва, неизвестной стоимости или ошибке следующие поиски останавливаются.")
+        consent = st.checkbox("Разрешаю дополнительные платные поиски в этих пределах", key=f"topup-consent-{run_id}")
+        if st.button("Разрешить дозаполнение и продолжить", disabled=not consent or not config.aitunnel_api_key, key=f"topup-go-{run_id}"):
+            try:
+                authorize_topup(store, run_id, budget_rub=budget, max_calls=int(calls), reserve_rub=reserve, confirmed=consent)
+                queue_run(store, run_id)
+                st.rerun()
+            except (ValueError, RuntimeError) as error:
+                st.error(str(error))
+    if status["ready"]:
+        with st.expander("Подготовить меньший план без нового поиска"):
+            count = st.selectbox("Количество статей", list(range(1, min(status["ready"], status["target"] - 1) + 1)), key=f"reduce-count-{run_id}")
+            run = store.one("SELECT * FROM pipeline_runs WHERE id=?", (run_id,))
+            snapshot = json.loads(run["settings_json"])
+            snapshot["max_articles_per_week"] = count
+            st.write("Новое расписание (Москва):")
+            st.write(week_slots(run["week_start"], snapshot))
+            if st.button(f"Сократить до {count} и продолжить Planner (платно)", key=f"reduce-go-{run_id}", disabled=not config.aitunnel_api_key):
+                try:
+                    reduce_plan(store, run_id, count, confirmed=True)
+                    queue_run(store, run_id)
+                    st.rerun()
+                except (ValueError, RuntimeError) as error:
+                    st.error(str(error))
 
 
 def dashboard(store, config):

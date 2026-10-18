@@ -64,12 +64,14 @@ def validate_run(result, service):
         raise ValueError("Ответ изменил run_id.")
 
 
-def discover(service, analytics, call_key):
+def discover(service, analytics, call_key, *, additional=None):
     from dzen_agent.services import citation_urls, similar, search_evidence_summary
     from dzen_agent.discovery_validation import reject
     revision = int(service.settings.get("analysis_revision", 0))
     old = service.store.one("SELECT * FROM discovery_results WHERE run_id=?", (service.run_id,))
-    if old and old["analysis_revision"] == revision:
+    if additional and service.store.one("SELECT id FROM discovery_batches WHERE call_key=?", (call_key,)):
+        return old["id"]  # Batch and aggregate are committed atomically below.
+    if old and old["analysis_revision"] == revision and not additional:
         result = DiscoveryV1.model_validate_json(old["payload_json"])
         if result.status != "insufficient_data":
             return old["id"]
@@ -83,6 +85,12 @@ def discover(service, analytics, call_key):
             "SELECT c.id,c.topic,c.scheduled_at,c.status FROM concepts c ORDER BY c.id DESC LIMIT 100"),
         "audience_signals": None, "search_config": {"target_candidates": service.settings["max_articles_per_week"] + 3,
             "max_sources_per_candidate": 3, "search_depth": "balanced", "excluded_domains": []}}
+    previous = DiscoveryV1.model_validate_json(old["payload_json"]) if old and old["analysis_revision"] == revision and additional else None
+    if additional:
+        context["search_config"]["target_candidates"] = additional["missing_count"]
+        context["additional_search"] = additional
+        context["existing_candidates"] = previous.model_dump(mode="json")["candidates"] if previous else []
+        context["excluded_ideas"] = previous.model_dump(mode="json")["rejected_ideas"] if previous else []
     result, response = service.structured("DISCOVERY", DiscoveryV1, context, call_key)
     validate_run(result, service)
     if result.planning_window.model_dump() != context["run_context"]["planning_window"]:
@@ -91,6 +99,9 @@ def discover(service, analytics, call_key):
     observations = {o["id"] for o in analytics.get("observations", [])}
     article_ids = {r["article_id"] for r in published + scheduled}
     used = [r["topic"] for r in published + scheduled]
+    if previous:
+        used.extend(i.topic for i in previous.candidates)
+        used.extend(i.topic for i in previous.rejected_ideas)
     issues = list(response.get("discovery_validation", []))
     accepted = []
     for idea in result.candidates:
@@ -109,12 +120,37 @@ def discover(service, analytics, call_key):
             issues.append({"idea_id": idea.idea_id, "type": "ungrounded_candidate", "message": message})
             continue
         if any(similar(idea.topic, t) for t in used):
+            if additional:
+                reject(result, idea.model_dump(), "Повтор уже найденной или исключённой темы.", reason_code="duplicate")
+                continue
             idea.viability_status = "needs_validation"
             idea.risks.append("Есть риск повтора темы.")
         if idea.viability_status == "ready_for_planning":
             used.append(idea.topic)
         accepted.append(idea)
     result.candidates = accepted
+    result.status = "partial" if any(i.viability_status == "ready_for_planning" for i in accepted) else "insufficient_data"
+    batch_json = result.model_dump_json()
+    if previous:
+        occupied = {i.idea_id for i in previous.candidates}
+        for idea in result.candidates:
+            if idea.idea_id in occupied:
+                original = idea.idea_id
+                idea.idea_id = f"{original}:{call_key.rsplit(':discovery', 1)[-1].strip(':')}"
+                while idea.idea_id in occupied:
+                    idea.idea_id += ":new"
+                issues.append({"type": "technical_repair", "message": "Уникальный ID при объединении поисковых пакетов",
+                               "before": original, "after": idea.idea_id})
+            occupied.add(idea.idea_id)
+        result.candidates = previous.candidates + result.candidates
+        result.rejected_ideas = previous.rejected_ideas + result.rejected_ideas
+        result.search_report.search_queries = list(dict.fromkeys(previous.search_report.search_queries + result.search_report.search_queries))
+        result.search_report.areas_searched = list(dict.fromkeys(previous.search_report.areas_searched + result.search_report.areas_searched))
+        result.search_report.performed = previous.search_report.performed or result.search_report.performed
+        result.search_report.limitations = list(dict.fromkeys(previous.search_report.limitations + result.search_report.limitations))
+        result.handoff.summary = previous.handoff.summary + "\n" + result.handoff.summary
+        for field in ("new_clusters", "strongest_opportunities", "concentration_warnings", "unresolved_questions"):
+            setattr(result.handoff, field, list(dict.fromkeys(getattr(previous.handoff, field) + getattr(result.handoff, field))))
     ready = [i for i in result.candidates if i.viability_status == "ready_for_planning"]
     if not ready:
         result.status = "insufficient_data"
@@ -126,7 +162,15 @@ def discover(service, analytics, call_key):
     service.store.log("DISCOVERY_VALIDATION", "Локальная проверка кандидатов Discovery без изменения оплаченного ответа", {
         "run_id": service.run_id, "call_key": call_key, "issues": issues, "accepted_ids": [i.idea_id for i in result.candidates],
         "ready_ids": [i.idea_id for i in ready], "search_evidence": search_evidence_summary(response)})
-    service.store.execute("INSERT INTO discovery_results(run_id,payload_json,prompt_version,created_at,analysis_revision) "
+    with service.store._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if old:
+            old_key = f"run:{service.run_id}" + (f":analysis-v{old['analysis_revision']}" if old["analysis_revision"] else "") + ":discovery"
+            conn.execute("INSERT OR IGNORE INTO discovery_batches(run_id,analysis_revision,call_key,payload_json,context_json,created_at) VALUES(?,?,?,?,?,?)",
+                         (service.run_id, old["analysis_revision"], old_key, old["payload_json"], "{}", old["created_at"]))
+        conn.execute("INSERT OR IGNORE INTO discovery_batches(run_id,analysis_revision,call_key,payload_json,context_json,created_at) VALUES(?,?,?,?,?,?)",
+                     (service.run_id, revision, call_key, batch_json, json.dumps(context, ensure_ascii=False), now_iso()))
+        conn.execute("INSERT INTO discovery_results(run_id,payload_json,prompt_version,created_at,analysis_revision) "
         "VALUES(?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET payload_json=excluded.payload_json,"
         "prompt_version=excluded.prompt_version,created_at=excluded.created_at,analysis_revision=excluded.analysis_revision",
         (service.run_id, result.model_dump_json(), service.prompts["DISCOVERY"]["id"], now_iso(), revision))

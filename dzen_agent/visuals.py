@@ -194,7 +194,7 @@ def prepare_visuals(service, article_id, call_key, *, force=False):
         saved_report = ImageV1.model_validate_json(saved["payload_json"])
         if saved_report.assembly.assembled_document_ref and saved_report.cover.status == "ready":
             active = service.store.active_image(article_id)
-            if active and Path(active["path"]).is_file():
+            if active and Path(active["path"]).is_file() and not validate_visuals(service.store, article_id):
                 return active["id"]
     model = service.settings.get("visual_model") or service.settings["research_model"]
     catalog = service.settings.get("public_catalog", {}).get("chat", {})

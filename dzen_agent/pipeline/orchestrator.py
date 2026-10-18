@@ -20,6 +20,14 @@ STAGES = ("COLLECT_STATS", "ANALYZE", "DISCOVERY", "PLAN", "PLAN_REVIEW", "RESEA
           "REVIEW", "DZEN_SCHEDULE", "VERIFY")
 
 
+class PartialStage(UserActionRequired):
+    """Per-article failures allow other articles to advance, never final approval."""
+
+
+class ItemBlocked(UserActionRequired):
+    """A prerequisite is missing; no paid operation may start."""
+
+
 def stages_for(settings: dict) -> tuple:
     return STAGES if settings.get("pipeline_flow") == "analytics_v1" else LEGACY_STAGES
 
@@ -103,10 +111,14 @@ class Pipeline:
         self.store.execute("UPDATE pipeline_runs SET status='RUNNING',started_at=COALESCE(started_at,?),"
                            "ended_at=NULL,error=NULL WHERE id=?", (now_iso(), run_id))
         stage = "COLLECT_STATS"
+        self._seen_research = set()
+        partial_errors = []
         try:
             if settings.get("pipeline_flow") == "analytics_v1" and not analytics_only:
                 editorial_pipeline.preflight(settings, json.loads(run["prompts_json"]))
             for stage in stages_for(settings):
+                if stage == "REVIEW" and partial_errors:
+                    raise UserActionRequired("Не все материалы готовы. " + "; ".join(partial_errors))
                 if analytics_only and stage not in ("COLLECT_STATS", "ANALYZE"):
                     self.store.execute("UPDATE pipeline_runs SET status='ANALYTICS_READY',error=NULL,ended_at=? WHERE id=?",
                                        (now_iso(), run_id))
@@ -161,7 +173,16 @@ class Pipeline:
                         else:
                             self.dzen.verify(row["article_id"])
                 else:
-                    self._stage(stage, run, service)
+                    self._item_errors = []
+                    try:
+                        self._stage(stage, run, service)
+                        if self._item_errors:
+                            raise PartialStage("; ".join(self._item_errors))
+                    except PartialStage as error:
+                        self.store.execute("UPDATE pipeline_stages SET status='ERROR',ended_at=?,error=? WHERE run_id=? AND stage=?",
+                                           (now_iso(), redact(str(error)), run_id, stage))
+                        partial_errors.append(redact(str(error)))
+                        continue
                 self.store.execute("UPDATE pipeline_stages SET status='SUCCEEDED',ended_at=? "
                                    "WHERE run_id=? AND stage=?", (now_iso(), run_id, stage))
             self.store.execute("UPDATE pipeline_runs SET status='SUCCEEDED',ended_at=? WHERE id=?",
@@ -188,6 +209,43 @@ class Pipeline:
     def articles(self, run_id):
         return self.store.rows("SELECT * FROM article_details WHERE run_id=? ORDER BY article_id", (run_id,))
 
+    def _item(self, run_id, concept, stage, operation, *, article_id=None):
+        """Durable diagnosis per version; paid idempotency remains in ai_calls."""
+        self._check_stop()
+        from dzen_agent.pipeline.items import item_fingerprint
+        fingerprint = item_fingerprint(self.store, concept, stage, article_id)
+        previous = self.store.one("SELECT * FROM pipeline_items WHERE run_id=? AND concept_id=? AND stage=? AND input_hash=?",
+                                  (run_id, concept["id"], stage, fingerprint))
+        if previous and previous["status"] == "SUCCEEDED" and not concept["needs_research"]:
+            if stage == "WRITE" and previous["article_id"] and self.store.get(previous["article_id"]):
+                return previous["article_id"]
+            if stage == "IMAGE":
+                from pathlib import Path
+                from dzen_agent.visuals import validate_visuals
+                active = self.store.active_image(article_id)
+                detail = self.store.detail(article_id)
+                native_writer = json.loads(detail["metadata_json"] or "{}").get("writer_contract")
+                if active and Path(active["path"]).is_file() and (not native_writer or not validate_visuals(self.store, article_id)):
+                    return active["id"]
+        self.store.execute("INSERT INTO pipeline_items(run_id,concept_id,stage,input_hash,status,article_id,attempts,updated_at) "
+                           "VALUES(?,?,?,?,'RUNNING',?,1,?) ON CONFLICT(run_id,concept_id,stage,input_hash) "
+                           "DO UPDATE SET status='RUNNING',attempts=attempts+1,error=NULL,updated_at=excluded.updated_at",
+                           (run_id, concept["id"], stage, fingerprint, article_id, now_iso()))
+        try:
+            value = operation()
+            status, message = "SUCCEEDED", None
+        except Exception as error:
+            self._check_stop()
+            status, message = ("BLOCKED" if isinstance(error, ItemBlocked) else "ERROR"), redact(str(error))
+            self._item_errors.append(f"{stage}, тема №{concept['id']}: {message}")
+            self.store.log(stage, message, {"run_id": run_id, "concept_id": concept["id"]})
+            value = None
+        self.store.execute("UPDATE pipeline_items SET status=?,error=?,article_id=COALESCE(?,article_id),updated_at=? "
+                           "WHERE run_id=? AND concept_id=? AND stage=? AND input_hash=?",
+                           (status, message, value if stage == "WRITE" else article_id, now_iso(),
+                            run_id, concept["id"], stage, fingerprint))
+        return value
+
     def _stage(self, stage, run, service):
         run_id = run["id"]
         key = f"run:{run_id}"
@@ -211,7 +269,13 @@ class Pipeline:
         analytics = json.loads(analytics_row["payload_json"])
         parse_analytics(analytics)
         if stage == "DISCOVERY":
-            service.discover(analytics, key + ":discovery")
+            try:
+                service.discover(analytics, key + ":discovery")
+            except UserActionRequired:
+                # A well-formed, grounded but insufficient result is retained for top-up.
+                if not self.store.one("SELECT id FROM discovery_results WHERE run_id=? AND analysis_revision=?",
+                                      (run_id, settings.get("analysis_revision", 0))):
+                    raise
         elif stage == "RESEARCH" and settings.get("pipeline_flow") == "analytics_v1":
             self._research_concepts(run_id, analytics, key, service)
         elif stage == "RESEARCH":
@@ -232,7 +296,14 @@ class Pipeline:
                 discovery = self.store.one("SELECT payload_json FROM discovery_results WHERE run_id=?", (run_id,))
                 if not discovery:
                     raise UserActionRequired("Сначала завершите Discovery.")
-                service.plan_from_discovery(analytics, json.loads(discovery["payload_json"]), run["week_start"], key + ":plan")
+                from dzen_agent.discovery_supply import fill_discovery
+                from dzen_agent.editorial_contracts import DiscoveryV1
+                if json.loads(discovery["payload_json"]).get("stage") == "discovery":
+                    DiscoveryV1.model_validate_json(discovery["payload_json"])
+                    payload = fill_discovery(service, analytics, key + ":discovery")
+                else:
+                    payload = json.loads(discovery["payload_json"])
+                service.plan_from_discovery(analytics, payload, run["week_start"], key + ":plan")
             else:
                 rows = self.store.rows("SELECT * FROM research_jobs WHERE run_id=? AND status='sufficient'", (run_id,))
                 service.plan(analytics, rows, run["week_start"], key + ":plan")
@@ -242,61 +313,83 @@ class Pipeline:
             concepts = self.store.rows("SELECT c.* FROM concepts c JOIN content_plans p ON p.id=c.plan_id "
                                        "WHERE p.run_id=? ORDER BY c.id", (run_id,))
             for concept in concepts:
-                self._check_stop()
-                service.write(concept["topic"], concept["research_id"], key + f":write:{concept['id']}",
-                              concept_row=concept)
+                def write(concept=concept):
+                    if concept["needs_research"]:
+                        raise ItemBlocked("Ожидает подтверждённого Research этой версии темы.")
+                    return service.write(concept["topic"], concept["research_id"], key + f":write:{concept['id']}",
+                                         concept_row=concept)
+                self._item(run_id, concept, "WRITE", write)
         elif stage == "IMAGE":
             for row in self.articles(run_id):
-                self._check_stop()
-                service.image(row["article_id"], key + f":image:{row['article_id']}")
+                concept = self.store.one("SELECT * FROM concepts WHERE id=?", (row["concept_id"],))
+                def image(row=row, concept=concept):
+                    upstream = self.store.one("SELECT status FROM pipeline_items WHERE run_id=? AND concept_id=? AND stage='WRITE' ORDER BY updated_at DESC,id DESC LIMIT 1",
+                                              (run_id, concept["id"]))
+                    if concept["needs_research"] or (upstream and upstream["status"] != "SUCCEEDED"):
+                        raise ItemBlocked("Сначала завершите актуальные Research и Writer.")
+                    return service.image(row["article_id"], key + f":image:{row['article_id']}")
+                self._item(run_id, concept, "IMAGE", image,
+                           article_id=row["article_id"])
+            if len(self.articles(run_id)) != settings["max_articles_per_week"]:
+                self._item_errors.append("Image ожидает недостающие тексты недели.")
         elif stage == "QA":
             articles = self.articles(run_id)
-            if len(articles) != settings["max_articles_per_week"]:
-                raise UserActionRequired("Не все статьи недели созданы.")
             for row in articles:
-                check = qa_article(self.store, row["article_id"])
-                if not check["passed"]:
-                    raise UserActionRequired(f"Статья №{row['article_id']}: " + "; ".join(check["issues"]))
-                if settings["ai_qa_enabled"]:
-                    article = self.store.get(row["article_id"])
-                    research = self.store.one("SELECT payload_json FROM research_jobs WHERE id=?",
-                                              (row["research_id"],))
-                    result, _ = service.structured("WRITER", ContentQA, service.context(
-                        topic=article.topic, article_title=article.title, article_body=article.body,
-                        article_summary=row["short_summary"], concept={},
-                        research=json.loads(research["payload_json"]),
-                        sources=json.loads(research["payload_json"])["sources"],
-                        publication_date=row["scheduled_at"],
-                    ), key + f":qa:{row['article_id']}:{check['fingerprint']}",
-                        article_id=row["article_id"], operation="OTHER")
-                    if not result.passed:
-                        raise UserActionRequired("Содержательная проверка: " + "; ".join(result.issues))
+                concept = self.store.one("SELECT * FROM concepts WHERE id=?", (row["concept_id"],))
+                self._item(run_id, concept, "QA", lambda row=row: self._qa(row, service, key, settings), article_id=row["article_id"])
+            if len(articles) != settings["max_articles_per_week"]:
+                self._item_errors.append("Не все статьи недели созданы.")
+
+    def _qa(self, row, service, key, settings):
+        check = qa_article(self.store, row["article_id"])
+        if not check["passed"]:
+            raise UserActionRequired(f"Статья №{row['article_id']}: " + "; ".join(check["issues"]))
+        if settings["ai_qa_enabled"]:
+            article = self.store.get(row["article_id"])
+            research = self.store.one("SELECT payload_json FROM research_jobs WHERE id=?",
+                                      (row["research_id"],))
+            result, _ = service.structured("WRITER", ContentQA, service.context(
+                topic=article.topic, article_title=article.title, article_body=article.body,
+                article_summary=row["short_summary"], concept={},
+                research=json.loads(research["payload_json"]),
+                sources=json.loads(research["payload_json"])["sources"],
+                publication_date=row["scheduled_at"],
+            ), key + f":qa:{row['article_id']}:{check['fingerprint']}",
+                article_id=row["article_id"], operation="OTHER")
+            if not result.passed:
+                raise UserActionRequired("Содержательная проверка: " + "; ".join(result.issues))
 
     def _research_concepts(self, run_id, analytics, key, service):
         concepts = self.store.rows("SELECT c.* FROM concepts c JOIN content_plans p ON p.id=c.plan_id "
                                    "WHERE p.run_id=? AND c.needs_research=1 ORDER BY c.id", (run_id,))
         for concept in concepts:
-            self._check_stop()
-            payload = json.loads(concept["payload_json"])
-            query = concept["topic"] + "\nРедакционный ракурс: " + payload["angle"]
-            fresh = concept["research_version"] > 0
-            if editorial_pipeline.native(service.prompts.get("RESEARCH"), "research"):
-                research_id = editorial_pipeline.research(service, concept,
-                    key + f":refresh:{concept['id']}:v{concept['research_version']}")
-            else:
-                research_id = service.research(
-                    query, analytics, key + f":refresh:{concept['id']}:v{concept['research_version']}",
-                    cache_topic=f"{concept['topic']} [груминг {concept['id']} v{concept['research_version']}]" if fresh else concept["topic"],
-                )
-            research = self.store.one("SELECT * FROM research_jobs WHERE id=?", (research_id,))
-            if not research or research["status"] != "sufficient":
-                raise UserActionRequired("Новое исследование не подтвердило изменённую тему.")
-            payload["research_job_id"] = research_id
-            payload["research_source_ids"] = [s["id"] for s in json.loads(research["payload_json"])["sources"]]
-            with self.store._connect() as conn:
-                conn.execute("UPDATE concepts SET research_id=?,payload_json=?,needs_research=0,status='PLANNED' "
-                             "WHERE id=? AND research_version=?",
-                             (research_id, dumps(payload), concept["id"], concept["research_version"]))
+            if concept["id"] in self._seen_research:
+                self._item_errors.append(f"Research темы №{concept['id']} ещё не завершён.")
+                continue
+            self._seen_research.add(concept["id"])
+            self._item(run_id, concept, "RESEARCH", lambda concept=concept: self._research_one(concept, analytics, key, service))
+
+    def _research_one(self, concept, analytics, key, service):
+        payload = json.loads(concept["payload_json"])
+        query = concept["topic"] + "\nРедакционный ракурс: " + payload["angle"]
+        fresh = concept["research_version"] > 0
+        if editorial_pipeline.native(service.prompts.get("RESEARCH"), "research"):
+            research_id = editorial_pipeline.research(service, concept,
+                key + f":refresh:{concept['id']}:v{concept['research_version']}")
+        else:
+            research_id = service.research(
+                query, analytics, key + f":refresh:{concept['id']}:v{concept['research_version']}",
+                cache_topic=f"{concept['topic']} [груминг {concept['id']} v{concept['research_version']}]" if fresh else concept["topic"],
+            )
+        research = self.store.one("SELECT * FROM research_jobs WHERE id=?", (research_id,))
+        if not research or research["status"] != "sufficient":
+            raise UserActionRequired("Новое исследование не подтвердило изменённую тему.")
+        payload["research_job_id"] = research_id
+        payload["research_source_ids"] = [s["id"] for s in json.loads(research["payload_json"])["sources"]]
+        with self.store._connect() as conn:
+            conn.execute("UPDATE concepts SET research_id=?,payload_json=?,needs_research=0,status='PLANNED' "
+                         "WHERE id=? AND research_version=?",
+                         (research_id, dumps(payload), concept["id"], concept["research_version"]))
 
 
 def approve_week(store: Store, run_id: int) -> None:

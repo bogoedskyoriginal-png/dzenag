@@ -79,7 +79,7 @@ class NativeAPI:
         elif stage == "planner":
             assert context["analytics"]["planner_brief"]["priority_clusters"]
             output = example(stage)
-            candidates = context["discovery"]["candidates"]
+            candidates = [c for c in context["discovery"]["candidates"] if c["viability_status"] == "ready_for_planning"]
             n = len(candidates)
             output.update(run_id=run, period=context["run_context"]["planning_window"])
             output["target"].update(article_count=n, selected_count=n)
@@ -206,7 +206,7 @@ def test_native_entire_chain_and_real_file_assembly(native_run, count):
     assert [x["scheduled_at"] for x in store.rows("SELECT scheduled_at FROM concepts ORDER BY scheduled_at")] == scheduled
 
 
-def test_one_research_failure_keeps_previous_paid_work_and_blocks_writer(native_run):
+def test_one_research_failure_keeps_other_articles_moving_and_blocks_only_its_writer(native_run):
     store, api, provider = native_run
     store.set_setting("max_articles_per_week", 5)
     run = create_run(store, "2030-01-07")
@@ -215,12 +215,15 @@ def test_one_research_failure_keeps_previous_paid_work_and_blocks_writer(native_
     approve_plan(store, store.one("SELECT id FROM content_plans")["id"])
     api.fail_research = "P001"
     assert pipeline.execute(run) == "NEEDS_ACTION"
-    assert len([x for x in api.calls if x[0] == "research"]) == 2
-    assert not [x for x in api.calls if x[0] == "writer"]
+    assert len([x for x in api.calls if x[0] == "research"]) == 5
+    assert len([x for x in api.calls if x[0] == "writer"]) == 4
+    assert all(c["concept"]["concept_id"] != "P001" for stage, c, _ in api.calls if stage == "writer")
+    assert len(store.rows("SELECT * FROM pipeline_items WHERE stage='QA' AND status='SUCCEEDED'")) == 4
     paid = len(api.calls)
     assert pipeline.execute(run) == "NEEDS_ACTION"
     assert len(api.calls) == paid
     assert store.one("SELECT status FROM research_jobs ORDER BY id")["status"] == "sufficient"
+    assert all(r["attempts"] == 1 for r in store.rows("SELECT attempts FROM pipeline_items WHERE stage IN ('WRITE','IMAGE') AND status='SUCCEEDED'"))
 
 
 @pytest.mark.parametrize("failure", ["json", "no_images", "download"])
@@ -365,7 +368,8 @@ def test_image_failure_does_not_repeat_other_articles(native_run):
     api.no_images_for = "P001"
     assert pipeline.execute(run) == "NEEDS_ACTION"
     assert len(store.list_all()) == 5
-    assert len(store.rows("SELECT * FROM images")) == 1
+    assert len(store.rows("SELECT * FROM images")) == 4
+    assert len(store.rows("SELECT * FROM pipeline_items WHERE stage='QA' AND status='SUCCEEDED'")) == 4
     paid = len(api.calls)
     assert pipeline.execute(run) == "NEEDS_ACTION"
     assert len(api.calls) == paid
@@ -491,3 +495,68 @@ def test_download_recovery_reuses_paid_search_response(native_run):
     assert pipeline.execute(run) == "AWAITING_REVIEW", store.one("SELECT error FROM pipeline_runs")
     assert len([1 for stage, _, inspecting in api.calls if stage == "image" and not inspecting]) == 1
     assert len([1 for stage, _, inspecting in api.calls if stage == "image" and inspecting]) == 1
+
+
+def test_one_invalid_writer_does_not_block_other_images_and_qa(native_run):
+    store, api, provider = native_run
+    store.set_setting("max_articles_per_week", 5)
+    run = create_run(store, "2030-01-07")
+    pipeline = Pipeline(store, provider)
+    pipeline.execute(run)
+    approve_plan(store, store.one("SELECT id FROM content_plans")["id"])
+    broken = True
+
+    def handler(request):
+        answer = api.handler(request)
+        if request.method == "POST":
+            payload = json.loads(request.content)
+            context = json.loads(payload["messages"][1]["content"]) if isinstance(payload["messages"][1]["content"], str) else {}
+            if broken and payload["model"] == "writer-test" and context["concept"]["concept_id"] == "P001":
+                data = answer.json()
+                data["choices"][0]["message"]["content"] = "{"
+                return httpx.Response(200, json=data)
+        return answer
+
+    provider.client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert pipeline.execute(run) == "NEEDS_ACTION"
+    assert len(store.list_all()) == 4
+    assert len(store.rows("SELECT * FROM pipeline_items WHERE stage='QA' AND status='SUCCEEDED'")) == 4
+    paid = len(api.calls)
+    assert pipeline.execute(run) == "NEEDS_ACTION"
+    assert len(api.calls) == paid
+    from dzen_agent.ui_workflow import failed_receipt
+    run_row = store.one("SELECT * FROM pipeline_runs WHERE id=?", (run,))
+    receipt = failed_receipt(store, run_row, "WRITE")
+    assert receipt["call_key"].endswith(":write:2")
+    authorize_retry(store, receipt["call_key"], confirmed=True)
+    broken = False
+    assert pipeline.execute(run) == "AWAITING_REVIEW", store.one("SELECT error FROM pipeline_runs")
+    assert len(store.list_all()) == 5
+    assert len([1 for stage, _, _ in api.calls if stage == "writer"]) == 6
+
+
+def test_one_qa_failure_does_not_block_other_qa_and_recovers_free(native_run, monkeypatch):
+    import dzen_agent.pipeline.orchestrator as orchestrator
+    store, api, provider = native_run
+    store.set_setting("max_articles_per_week", 5)
+    run = create_run(store, "2030-01-07")
+    pipeline = Pipeline(store, provider)
+    pipeline.execute(run)
+    approve_plan(store, store.one("SELECT id FROM content_plans")["id"])
+    original = orchestrator.qa_article
+
+    def fail_one(store, article_id):
+        result = original(store, article_id)
+        if article_id == 2:
+            result.update(passed=False, issues=["Mock: повреждена иллюстрация"])
+        return result
+
+    monkeypatch.setattr(orchestrator, "qa_article", fail_one)
+    assert pipeline.execute(run) == "NEEDS_ACTION"
+    assert len(store.rows("SELECT * FROM pipeline_items WHERE stage='QA' AND status='SUCCEEDED'")) == 4
+    with pytest.raises(ValueError):
+        orchestrator.approve_week(store, run)
+    paid = len(api.calls)
+    monkeypatch.setattr(orchestrator, "qa_article", original)
+    assert pipeline.execute(run) == "AWAITING_REVIEW"
+    assert len(api.calls) == paid
