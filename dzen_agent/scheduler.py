@@ -85,3 +85,15 @@ def launch_pipeline(run_id: int, *, send=False, analytics_only=False) -> int:
         process = subprocess.Popen(command, cwd=PROJECT_ROOT, stdout=log, stderr=log,
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     return process.pid
+
+
+def launch_publication(article_id: int, *, update=False) -> int:
+    directory = PROJECT_ROOT / "logs"
+    directory.mkdir(exist_ok=True)
+    command = [sys.executable, "-m", "dzen_agent.browser.publish_worker", str(article_id)]
+    if update:
+        command.append("--update")
+    with (directory / f"publication-{article_id}.log").open("ab") as log:
+        process = subprocess.Popen(command, cwd=PROJECT_ROOT, stdout=log, stderr=log,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    return process.pid

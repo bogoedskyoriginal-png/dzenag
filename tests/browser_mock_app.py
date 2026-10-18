@@ -20,6 +20,8 @@ import dzen_agent.scheduler as scheduler_module
 import dzen_agent.visuals as visuals_module
 from dzen_agent.config import PROJECT_ROOT, get_settings
 from dzen_agent.pipeline.orchestrator import Pipeline
+from dzen_agent.browser.scheduling import DzenScheduling
+from dzen_agent.pipeline.run import PublishingOnlyProvider, assert_publish_ready
 from dzen_agent.provider import AITunnel
 from dzen_agent.store import Store, dumps
 
@@ -32,6 +34,9 @@ config = replace(original_config, database_path=database, aitunnel_api_key="mock
 spec = importlib.util.spec_from_file_location("native_ui_fixture", PROJECT_ROOT / "tests/test_editorial_contracts_v1.py")
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
+studio_spec = importlib.util.spec_from_file_location("studio_ui_fixture", PROJECT_ROOT / "tests/test_publishing_pipeline.py")
+studio_fixture = importlib.util.module_from_spec(studio_spec)
+studio_spec.loader.exec_module(studio_fixture)
 api = fixture.NativeAPI()
 base_topics = list(fixture.TOPICS)
 flags = database.with_suffix(".flags.json")
@@ -89,7 +94,11 @@ def launch(run_id, **kwargs):
     if flags.exists() and json.loads(flags.read_text("utf-8")).get("simulate_running"):
         store.execute("UPDATE pipeline_runs SET status='RUNNING' WHERE id=?", (run_id,))
         return 123
-    Pipeline(store, AITunnel(store, "mock-key")).execute(run_id, analytics_only=kwargs.get("analytics_only", False))
+    if kwargs.get("send"):
+        assert_publish_ready(store, run_id)
+        Pipeline(store, PublishingOnlyProvider(), dzen=DzenScheduling(store, studio_fixture.MockStudio(store))).execute(run_id, allow_dzen=True)
+    else:
+        Pipeline(store, AITunnel(store, "mock-key")).execute(run_id, analytics_only=kwargs.get("analytics_only", False))
     return 123
 
 

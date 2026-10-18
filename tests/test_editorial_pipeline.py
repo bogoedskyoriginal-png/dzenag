@@ -28,6 +28,7 @@ def test_plan_review_stops_before_any_writing(editorial_plan, mode):
 def test_autopilot_skips_plan_gate(editorial_plan):
     store, run_id, _, _ = editorial_plan
     store.set_setting("mode", "AUTOPILOT")
+    store.set_setting("dzen_autopilot_authorized", True)
     stages = []
 
     class Controlled(Pipeline):

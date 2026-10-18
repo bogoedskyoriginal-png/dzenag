@@ -26,10 +26,38 @@ def main() -> int:
         print("Запуск по расписанию выключен.")
         return 0
     run_id = args.run_id or create_run(store, args.week)
-    result = Pipeline(store, AITunnel(store, config.aitunnel_api_key)).execute(
+    from dzen_agent.browser.publisher import DzenPublisher
+    from dzen_agent.browser.scheduling import DzenScheduling
+    adapter = DzenPublisher(store, config)
+    if args.send:
+        # A send click must never enter a paid generation stage, even after an error.
+        assert_publish_ready(store, run_id)
+        provider = PublishingOnlyProvider()
+    else:
+        provider = AITunnel(store, config.aitunnel_api_key)
+    result = Pipeline(store, provider, dzen=DzenScheduling(store, adapter) if adapter.verified else None).execute(
         run_id, allow_dzen=args.send, analytics_only=args.analytics_only)
     print(f"Pipeline {run_id}: {result}")
     return 1 if result in ("NEEDS_ACTION", "STOPPED") else 0
+
+
+class PublishingOnlyProvider:
+    def __getattr__(self, name):
+        raise RuntimeError("Отправка в Дзен не может выполнять AI-запросы.")
+
+
+def assert_publish_ready(store, run_id):
+    from dzen_agent.errors import UserActionRequired
+    from dzen_agent.pipeline.orchestrator import stages_for
+    import json
+    run = store.one("SELECT * FROM pipeline_runs WHERE id=?", (run_id,))
+    if not run or not run["approved_at"]:
+        raise UserActionRequired("Сначала утвердите готовые материалы недели.")
+    stages = stages_for(json.loads(run["settings_json"]))
+    required = stages[:stages.index("REVIEW")]
+    actual = {r["stage"]: r["status"] for r in store.rows("SELECT * FROM pipeline_stages WHERE run_id=?", (run_id,))}
+    if any(actual.get(stage) != "SUCCEEDED" for stage in required):
+        raise UserActionRequired("Подготовка недели не завершена. Отправка не запускает платные этапы.")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,9 @@ STATUS = {"PENDING": "Ожидает", "RUNNING": "В работе", "ERROR": "�
     "WRITTEN": "Текст готов", "IMAGE_READY": "Оформлено", "READY_FOR_REVIEW": "Готово к проверке",
     "DRAFT": "Черновик", "RESEARCHED": "Исследовано", "SCHEDULED": "Передано в расписание",
     "SCHEDULED_VERIFIED": "В расписании Дзена"}
+STATUS.update({"PREPARING_IN_DZEN": "Начинается перенос", "CREATING_DRAFT": "Создаётся черновик",
+    "RENDERING": "Идёт вёрстка", "DRAFT_READY": "Черновик свёрстан", "SAVING_SCHEDULE": "Сохраняется отложенная статья",
+    "SCHEDULED_PENDING_VERIFY": "Проверяется расписание"})
 DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
@@ -311,9 +314,22 @@ def run_card(store, config, run_id):
             if st.button("Проверить контент-план", type="primary", key=f"plan-{run_id}"):
                 navigate("Контент-план", selected_plan_run=run_id)
         elif run["status"] in ("AWAITING_REVIEW", "APPROVED", "AWAITING_SEND", "SUCCEEDED") or (stage and stage["stage"] in ("DZEN_SCHEDULE", "VERIFY")):
-            st.info("Откройте материалы для чтения и итогового утверждения. Автоматическая отправка в Дзен пока не подтверждена.")
+            from dzen_agent.browser.publisher import DzenPublisher
+            ready = DzenPublisher(store, config).verified
+            st.info("Проверьте материалы и расписание. Утверждённые статьи можно передать в отложенные." if ready else
+                    "Откройте материалы для чтения и итогового утверждения. Сначала нужна проверка отправки на вашем канале.")
             if st.button("Проверить материалы", type="primary", key=f"materials-{run_id}"):
                 navigate("Материалы", material_run=run_id)
+            if run["approved_at"] and run["status"] != "SUCCEEDED":
+                if st.button("Продолжить отправку в Дзен", disabled=not ready, key=f"send-{run_id}"):
+                    queue_run(store, run_id, send=True)
+                    st.rerun()
+                st.caption("AI-запросы не выполняются. Готовые отложенные статьи повторно не создаются.")
+            for item in store.rows("SELECT a.title,p.* FROM publications p JOIN articles a ON a.id=p.article_id "
+                                   "JOIN article_details d ON d.article_id=a.id WHERE d.run_id=? ORDER BY p.scheduled_at", (run_id,)):
+                st.caption(item["title"] + " · " + human_status(item["status"]))
+                if item["error"]:
+                    st.warning(item["error"])
         elif stage:
             receipt = failed_receipt(store, run, stage["stage"]) if stage["status"] == "ERROR" else None
             if stage["status"] == "ERROR" and receipt:
@@ -359,9 +375,11 @@ def dashboard(store, config):
     st.caption("Перемотка · от идеи до готового материала")
     settings = store.settings()
     last_balance = store.one("SELECT balance_after,timestamp FROM usage_events WHERE balance_after IS NOT NULL ORDER BY id DESC LIMIT 1")
+    from dzen_agent.browser.publisher import DzenPublisher
+    dzen_ready = DzenPublisher(store, config).verified
     st.caption(MODES.get(settings["mode"], settings["mode"]) + " · " + ("Ключ AI настроен" if config.aitunnel_api_key else "Нужен ключ AI")
         + (f" · Баланс по последнему ответу: {last_balance['balance_after']:.2f} ₽" if last_balance else " · Баланс ещё не проверен")
-        + " · Дзен: требуется ручная проверка")
+        + (" · Дзен: отложенная публикация проверена" if dzen_ready else " · Дзен: требуется ручная проверка"))
     overview, expenses = st.tabs(["Производство", "Расходы"])
     with overview:
         if st.session_state.get("show_wizard"):

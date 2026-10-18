@@ -9,7 +9,6 @@ from uuid import uuid4
 import streamlit as st
 
 from dzen_agent.browser.session import launch_session
-from dzen_agent.browser.scheduling import DzenScheduling
 from dzen_agent.editorial_pipeline import native
 from dzen_agent.editorial_ui import grooming_panel
 from dzen_agent.pipeline.orchestrator import approve_week
@@ -232,9 +231,15 @@ def articles_page(store, config):
         if run and not run["approved_at"]:
             qa = store.one("SELECT status FROM pipeline_stages WHERE run_id=? AND stage='QA'", (run["id"],))
             if qa and qa["status"] == "SUCCEEDED":
-                st.caption("Итоговое утверждение проверит все статьи этой недели. Публикация не запускается.")
+                from dzen_agent.browser.publisher import DzenPublisher
+                can_schedule = DzenPublisher(store, config).verified
+                auto_send = store.settings()["mode"] == "REVIEW" and can_schedule
+                st.caption("После утверждения статьи будут поставлены в отложенные по плану." if auto_send else
+                           "Итоговое утверждение проверит все статьи этой недели. Отправка доступна отдельно.")
                 if st.button("Утвердить материалы недели", type="primary"):
                     if action("Проверяю неделю…", lambda: approve_week(store, run["id"]) or True):
+                        if auto_send:
+                            action("Передаю статьи в Дзен…", lambda: queue_run(store, run["id"], send=True))
                         st.rerun()
         preview, edit, images, qa_tab, history = st.tabs(["Статья", "Редактировать", "Оформление", "Проверка", "История"])
         with preview:
@@ -281,14 +286,30 @@ def articles_page(store, config):
                 if action("Проверяю материал…", lambda: qa_article(store, article_id)):
                     st.rerun()
             with st.expander("Передача в Дзен"):
-                st.info("Заполнение редактора доступно. Загрузка всех иллюстраций и автоматическое планирование пока не подтверждены.")
-                st.caption("Откроется браузер с заголовком и текстом. Проверку изображений и публикацию вы выполняете вручную.")
-                if st.button("Открыть статью в редакторе Дзена"):
-                    action("Открываю редактор…", lambda: launch_session(article_id), success="Редактор открыт. Публикация не выполнялась.")
-                if st.button("Обновить статью в Дзене", disabled=True,
-                    help="Автоматическое обновление ещё не проверено. Используйте ручной редактор."):
-                    action("Проверяю возможность обновления…", lambda: DzenScheduling(store).update(article_id))
+                from dzen_agent.browser.publisher import DzenPublisher
+                from dzen_agent.scheduler import launch_publication
+                ready = DzenPublisher(store, config).verified
+                st.info("Статья переносится с форматированием и иллюстрациями, затем проверяется в отложенных." if ready else
+                        "Автоматическая отправка заблокирована до проверки текущего интерфейса на вашем канале.")
+                if st.button("Открыть Дзен для ручного входа", key=f"login-{article_id}"):
+                    action("Открываю браузер…", launch_session, success="Выполните вход вручную и закройте окно перед отправкой.")
                 publication = store.one("SELECT * FROM publications WHERE article_id=?", (article_id,))
+                if publication:
+                    st.write("**" + human_status(publication["status"]) + "**")
+                    if publication["error"]:
+                        st.warning(publication["error"])
+                update = bool(publication and publication["status"] == "SCHEDULED_VERIFIED")
+                if st.button("Утвердить и обновить эту статью в Дзене" if update else "Передать / продолжить эту статью в Дзен",
+                             disabled=not ready or store.settings()["stop_requested"] or (not update and article.status != "APPROVED")):
+                    def send_one():
+                        from dzen_agent.models import ArticleStatus
+                        check = qa_article(store, article_id)
+                        if not check["passed"]:
+                            raise ValueError("QA: " + "; ".join(check["issues"]))
+                        if update:
+                            store.update_status(article_id, ArticleStatus.APPROVED)
+                        return launch_publication(article_id, update=update)
+                    action("Передаю в Дзен…", send_one, success="Отправка передана в фон. Остальные статьи не затрагиваются.")
                 if publication and publication["dzen_url"]:
                     st.link_button("Открыть сохранённую публикацию", publication["dzen_url"])
         with history:

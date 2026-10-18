@@ -159,6 +159,18 @@ def main():
             wait_db(lambda: store.one("SELECT approved_at FROM pipeline_runs WHERE id=1")["approved_at"])
             assert store.one("SELECT approved_at FROM pipeline_runs WHERE id=1")["approved_at"]
             check("QA and final approval without Dzen")
+            from dzen_agent.browser.publisher import ADAPTER_VERSION, profile_identity
+            store.set_setting("dzen_adapter_verification", {"adapter_version": ADAPTER_VERSION,
+                "profile_identity": profile_identity(get_settings()), "scheduled_verified": True, "edit_verified": True,
+                "studio_url": "https://dzen.ru/profile/editor/test/publications", "test_editor_url": "https://dzen.ru/profile/editor/test/1/edit"})
+            paid_before_send = store.costs()["requests"]
+            nav("Рабочий стол")
+            page.get_by_role("button", name="Продолжить отправку в Дзен", exact=True).click()
+            wait_db(lambda: (store.one("SELECT status FROM publications WHERE article_id=1") or {}).get("status") == "SCHEDULED_VERIFIED")
+            assert store.costs()["requests"] == paid_before_send
+            page.get_by_text("В расписании Дзена", exact=False).first.wait_for()
+            check("approved article sent to mock Studio without AI and with visible status")
+            page.get_by_role("button", name="Проверить материалы", exact=True).click()
             page.get_by_role("tab", name="Редактировать", exact=True).click()
             page.get_by_role("textbox", name="Заголовок", exact=True).fill("Редакторская версия материала")
             page.get_by_role("button", name="Сохранить изменения", exact=True).click()

@@ -93,7 +93,7 @@ def settings_page(store, config):
     with mode:
         selected = st.radio("Режим подготовки", list(MODES), index=list(MODES).index(settings["mode"]), format_func=lambda value: MODES[value])
         st.caption("С проверкой редактора — утверждение тем и готовых материалов. Ручной — передача в Дзен отдельным действием. "
-                   "Автономный режим допускает фоновую работу по расписанию; интеграция отправки пока не подтверждена.")
+                   "Автономная отправка в Дзен требует отдельного разрешения на вкладке «Дзен».")
         confirmed = st.checkbox("Разрешаю автономные AI-расходы и действия после проверки интеграции")
         if st.button("Применить режим"):
             if selected == "AUTOPILOT" and not confirmed:
@@ -102,7 +102,15 @@ def settings_page(store, config):
                 store.set_setting("mode", selected)
                 st.success("Режим сохранён.")
     with dzen:
-        st.info("Заполнение редактора доступно. Полная загрузка оформления и автоматическое планирование ещё не проверены на канале.")
+        from dzen_agent.browser.publisher import DzenPublisher
+        verified = DzenPublisher(store, config).verified
+        st.info("Вёрстка, отложенная публикация и редактирование проверены на этом профиле." if verified else
+                "Отправка заблокирована до реального теста на вашем канале.")
+        autopilot = st.checkbox("Разрешаю ставить статьи в отложенные в режиме AUTOPILOT",
+                               value=settings.get("dzen_autopilot_authorized", False), disabled=not verified)
+        if st.button("Сохранить разрешение отправки", disabled=not verified):
+            store.set_setting("dzen_autopilot_authorized", autopilot)
+            st.success("Разрешение сохранено. Немедленных публикаций не будет.")
         editor_url = st.text_input("Адрес редактора вашего канала", settings["dzen_editor_url"])
         if st.button("Сохранить адрес редактора"):
             store.set_setting("dzen_editor_url", editor_url)

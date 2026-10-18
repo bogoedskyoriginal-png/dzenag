@@ -1,0 +1,49 @@
+<!doctype html><html lang="ru"><meta charset="utf-8"><title>Local Dzen editor contract fixture</title>
+<style>[contenteditable] {min-height:32px;border:1px solid #ddd} img {width:120px} [hidden]{display:none!important}</style>
+<span>Сохранено меньше минуты назад</span>
+<div contenteditable="true" id="title"><h1 data-block="true">Прежний заголовок</h1></div>
+<div contenteditable="true" id="body"><div data-editor="ZenDraftEditor" data-block="true"><br></div></div>
+<button data-tip="Вставить изображение" onclick="document.querySelector('#upload').hidden=false">Изображение</button>
+<div id="upload" hidden><input type="file" accept="image/png,image/jpeg"></div>
+<button id="open">Опубликовать</button>
+<div class="article-editor-desktop--publication-modal__publicationModal-test" hidden id="modal">
+ <div class="cover-picker__coverContainer-test">Обложка</div>
+ <label><input type="checkbox" class="checkbox-v2__input-test"><span class="checkbox-input__title-test">Опубликовать позже</span></label>
+ <input type="text" readonly value="1 января 2099"><input name="delayedTime" type="text" value="16:00">
+ <div class="datepicker-calendar__datepickerCalendar-test" hidden id="calendar">
+  <span class="datepicker-calendar-header__title-test">Январь 2099</span>
+  <table><tr><td data-testid="datepicker-calendar-day" class="datepicker-calendar-day__isAvailable-test">31</td></tr></table>
+ </div>
+ <span>GMT+3</span><button id="save">Опубликовать позже</button>
+</div>
+<script>
+window.finalSaves=0;
+const body=document.querySelector('#body');
+function empty(){ if(!body.querySelector('[data-editor]')) {
+ const p=document.createElement('div'); p.dataset.editor='ZenDraftEditor'; p.dataset.block='true';
+ p.innerHTML=body.innerHTML||'<br>';body.replaceChildren(p);
+}}
+body.addEventListener('input',empty);
+body.addEventListener('paste',e=>{
+ e.preventDefault(); const doc=new DOMParser().parseFromString(e.clipboardData.getData('text/html'),'text/html');
+ for(const block of [...doc.body.children]){
+   if(block.tagName==='UL'||block.tagName==='OL'){
+     for(const li of block.querySelectorAll('li')){li.dataset.block='true'; li.dataset.editor='ZenDraftEditor'}
+   } else {block.dataset.block='true';block.dataset.editor='ZenDraftEditor'}
+   body.append(block);
+ }
+});
+document.querySelector('input[type=file]').addEventListener('change',e=>{
+ const reader=new FileReader();reader.onload=()=>{
+  const fig=document.createElement('figure');fig.dataset.block='true';fig.dataset.editor='ZenDraftEditor';
+  const img=document.createElement('img');img.src=reader.result;fig.append(img);body.append(fig);
+  document.querySelector('#upload').hidden=true;
+ };reader.readAsDataURL(e.target.files[0]);e.target.value='';
+});
+document.querySelector('#open').onclick=()=>document.querySelector('#modal').hidden=false;
+document.querySelector('input[readonly]').onclick=()=>document.querySelector('#calendar').hidden=false;
+document.querySelector('td').onclick=()=>{
+ document.querySelector('input[readonly]').value='31 января 2099';document.querySelector('#calendar').hidden=true;
+};
+document.querySelector('#save').onclick=()=>window.finalSaves++;
+</script></html>

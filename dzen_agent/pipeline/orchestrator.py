@@ -141,8 +141,12 @@ class Pipeline:
                     fresh = self.store.one("SELECT approved_at FROM pipeline_runs WHERE id=?", (run_id,))
                     if current_mode != "AUTOPILOT" and not fresh["approved_at"]:
                         return self._wait(run_id, stage, "AWAITING_REVIEW", "Нужно повторное утверждение недели.")
-                    if current_mode != "AUTOPILOT" and not allow_dzen:
+                    if current_mode == "MANUAL" and not allow_dzen:
                         return self._wait(run_id, stage, "AWAITING_SEND", "Нажмите «Отправить в Дзен».")
+                    if current_mode == "AUTOPILOT" and not self.store.settings().get("dzen_autopilot_authorized", False):
+                        return self._wait(run_id, stage, "AWAITING_SEND", "Разрешите автоматическую отправку в настройках Дзена.")
+                    if not self.dzen and current_mode == "REVIEW" and not allow_dzen:
+                        return self._wait(run_id, stage, "AWAITING_SEND", "Сначала проверьте интеграцию с вашим каналом Дзена.")
                     if not self.dzen:
                         raise UserActionRequired(
                             "Отложенная публикация ещё не проверена на вашем канале. "
@@ -170,7 +174,7 @@ class Pipeline:
             self.store.log(stage, message, {"run_id": run_id, "log": str(path)})
             status = "STOPPED" if self.store.settings()["stop_requested"] else "NEEDS_ACTION"
             self.store.execute("UPDATE pipeline_stages SET status='ERROR',ended_at=?,error=? "
-                               "WHERE run_id=? AND stage=?", (now_iso(), message, run_id, stage))
+                               "WHERE run_id=? AND stage=? AND status<>'SUCCEEDED'", (now_iso(), message, run_id, stage))
             self.store.execute("UPDATE pipeline_runs SET status=?,ended_at=?,error=? WHERE id=?",
                                (status, now_iso(), message, run_id))
             return status

@@ -271,7 +271,7 @@ def prepare_visuals(service, article_id, call_key, *, force=False):
     report.publishing_handoff.execution_status = "not_attempted"
     report.publishing_handoff.verified_in_dzen = False
     report.publishing_handoff.draft_id = report.publishing_handoff.draft_url = None
-    report.publishing_handoff.issues = ["Живой адаптер загрузки оформленной статьи в Дзен не подключён."]
+    report.publishing_handoff.issues = ["Передача оформленной статьи в Дзен ещё не выполнялась."]
     report.assembly.original_content_hash = digest(article.body.encode())
     report.assembly.assembled_document_ref = None
     report.assembly.headline = article.title
