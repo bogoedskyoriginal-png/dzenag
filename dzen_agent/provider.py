@@ -156,6 +156,17 @@ class AITunnel:
                         "Результат предыдущего AI-запроса неизвестен. Автоповтор отключён, "
                         "чтобы не списать деньги дважды. Проверьте историю AITUNNEL."
                     )
+                if previous["status"] == "ERROR":
+                    try:
+                        previous_http = json.loads(previous["result_json"] or "{}").get("http_error", {}).get("http_status")
+                    except (ValueError, AttributeError):
+                        previous_http = None
+                    # Preserve the existing explicit-resume policy for rate limiting only.
+                    if previous_http != 429:
+                        raise UserActionRequired(
+                            "Предыдущий AI-запрос завершился ошибкой. Автоповтор отключён. "
+                            "Проверьте диагностику и явно разрешите новый запрос в разделе восстановления. "
+                            + (previous["error"] or ""))
             self.guard()
             retries = min(3, max(0, int(self.store.settings()["max_retries"])))
             for attempt in range(retries + 1):
@@ -199,14 +210,36 @@ class AITunnel:
                     if isinstance(error, UserActionRequired):
                         uncertain = False
                     message = self._human_error(error, status_code)
-                    log_exception(error, f"AI {operation}; model={model}; request_id={request_id}")
+                    diagnostic = None
+                    if isinstance(error, httpx.HTTPStatusError):
+                        from dzen_agent.http_diagnostics import error_detail, http_diagnostic
+                        diagnostic = http_diagnostic(error, model=model, payload=payload, operation=operation,
+                                                     call_key=call_key, api_key=self.api_key)
+                        request_id = diagnostic["request_id"]
+                        if status_code == 400:
+                            message = "AITUNNEL: ошибка HTTP 400. " + error_detail(diagnostic) + (
+                                " Подробности сохранены в локальный журнал. Автоповтор отключён.")
+                    # Do not discard billing information if an HTTP error happens to include it.
+                    if isinstance(error, httpx.HTTPStatusError):
+                        try:
+                            error_data = error.response.json()
+                            if isinstance(error_data, dict) and isinstance(error_data.get("usage", {}), dict):
+                                usage = parse_usage(error_data)
+                        except (ValueError, TypeError):
+                            pass
+                    log_exception(error, f"AI {operation}; model={model}; request_id={request_id}"
+                                  + ("\nHTTP diagnostic: " + dumps(diagnostic) if diagnostic else ""))
                     with self.store._connect() as conn:
                         self._usage(conn, call_key, operation, model, run_id, article_id,
                                     usage, False, message, request_id)
                         conn.execute("UPDATE ai_calls SET status=?,error=?,updated_at=? WHERE call_key=?",
                                      ("UNCERTAIN" if uncertain else "ERROR", message,
                                       now_iso(), call_key))
-                    self.store.log(operation, message, {"model": model, "request_id": request_id})
+                        if diagnostic:
+                            conn.execute("UPDATE ai_calls SET result_json=? WHERE call_key=?",
+                                         (dumps({"http_error": diagnostic}), call_key))
+                    self.store.log(operation, message, {"model": model, "request_id": request_id,
+                                                       "http_status": status_code})
                     if status_code == 429 and attempt < retries:
                         time.sleep(min(2 ** attempt, 4))
                         self.guard()

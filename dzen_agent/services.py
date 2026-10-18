@@ -151,6 +151,10 @@ class ContentService:
         model_limit = self.settings.get("public_catalog", {}).get("chat", {}).get(model, {}).get("max_output")
         if isinstance(model_limit, int) and model_limit > 0:
             payload["max_tokens"] = min(payload["max_tokens"], model_limit)
+        if model.rsplit("/", 1)[-1] in ("sonar", "sonar-pro", "sonar-reasoning-pro", "sonar-deep-research", "sonar-pro-search"):
+            # Sonar's response_format union accepts text/json_schema, not json_object.
+            payload["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": schema.__name__, "strict": True, "schema": schema.model_json_schema()}}
         if kind == "ANALYTICS" and model.rsplit("/", 1)[-1] == "deepseek-v4-flash-0731":
             effort = self.settings.get("analytics_reasoning_effort", "low")
             if effort not in ("low", "medium", "high"):
