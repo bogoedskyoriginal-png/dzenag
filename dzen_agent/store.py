@@ -28,6 +28,7 @@ DEFAULTS = {
     "statistics_max_age_days": 14, "research_use_web_tool": False,
     "analytics_model": "", "research_model": "", "planner_model": "",
     "discovery_model": "",
+    "visual_model": "",
     "writer_model": "", "image_model": "", "dzen_statistics_url": "",
     "image_quality": "low", "dzen_adapter_verified": False,
     "dzen_editor_url": "",

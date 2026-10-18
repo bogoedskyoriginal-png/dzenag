@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS articles (
  id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, title TEXT NOT NULL,
@@ -140,6 +140,15 @@ CREATE TABLE discovery_results (
 """
 
 
+VISUAL_SCHEMA = """
+ALTER TABLE content_plans ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}';
+CREATE TABLE visual_results (
+ id INTEGER PRIMARY KEY, article_id INTEGER NOT NULL REFERENCES articles(id),
+ call_key TEXT NOT NULL UNIQUE, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+"""
+
+
 def migrate(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path, timeout=30) as conn:
@@ -159,7 +168,7 @@ def migrate(path: Path) -> None:
         try:
             # Another process may have migrated while we acquired the write lock.
             current = conn.execute("PRAGMA user_version").fetchone()[0]
-            for target, script in ((1, SCHEMA), (2, EDITORIAL_SCHEMA), (3, ANALYTICS_SCHEMA)):
+            for target, script in ((1, SCHEMA), (2, EDITORIAL_SCHEMA), (3, ANALYTICS_SCHEMA), (4, VISUAL_SCHEMA)):
                 if current < target:
                     for statement in script.split(";"):
                         if statement.strip():

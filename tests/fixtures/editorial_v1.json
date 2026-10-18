@@ -1,0 +1,457 @@
+{
+  "discovery": [
+    {
+      "contract_version": "1.0",
+      "stage": "discovery",
+      "status": "ok",
+      "run_id": null,
+      "planning_window": {
+        "start": null,
+        "end": null,
+        "timezone": "Europe/Moscow"
+      },
+      "search_report": {
+        "performed": true,
+        "online_access": "available",
+        "areas_searched": [],
+        "search_queries": [],
+        "limitations": []
+      },
+      "candidates": [],
+      "rejected_ideas": [],
+      "handoff": {
+        "summary": "",
+        "new_clusters": [],
+        "strongest_opportunities": [],
+        "concentration_warnings": [],
+        "unresolved_questions": []
+      }
+    },
+    {
+      "idea_id": "D001",
+      "type": "evergreen",
+      "viability_status": "ready_for_planning",
+      "priority": "high",
+      "topic": "",
+      "cluster": "",
+      "angle": "",
+      "working_headline": "",
+      "audience_hook": "",
+      "reader_promise": "",
+      "why_now": null,
+      "event_date": null,
+      "timing_note": "",
+      "content_format": "",
+      "novelty_status": "new",
+      "possible_duplicate_article_ids": [],
+      "analytics_observation_ids": [],
+      "editorial_rationale": "",
+      "scores": {
+        "audience_fit": 0,
+        "channel_novelty": 0,
+        "headline_potential": 0,
+        "source_strength": 0,
+        "editorial_fit": 0
+      },
+      "anchor_facts": [],
+      "sources": [],
+      "selection_feasibility": {
+        "status": "not_applicable",
+        "target_count": null,
+        "verified_subjects": []
+      },
+      "research_questions": [],
+      "risks": [],
+      "series_potential": null
+    },
+    {
+      "claim": "",
+      "source_ids": [],
+      "confidence": "medium"
+    },
+    {
+      "source_id": "S001",
+      "title": "",
+      "publisher": "",
+      "url": "",
+      "publication_date": null,
+      "source_type": "secondary",
+      "supports": ""
+    },
+    {
+      "title": "",
+      "year": null,
+      "relevance": "",
+      "source_ids": []
+    },
+    {
+      "topic": "",
+      "reason_code": "duplicate",
+      "reason": "",
+      "related_article_ids": []
+    }
+  ],
+  "planner": [
+    {
+      "contract_version": "1.0",
+      "stage": "planner",
+      "status": "ok",
+      "run_id": null,
+      "plan_id": null,
+      "plan_revision": 1,
+      "mode": "create",
+      "period": {
+        "start": null,
+        "end": null,
+        "timezone": "Europe/Moscow"
+      },
+      "target": {
+        "article_count": 5,
+        "target_scope": "total_period",
+        "selected_count": 0,
+        "existing_count": 0,
+        "unfilled_count": 0
+      },
+      "editorial_strategy": {
+        "period_goal": "",
+        "main_approach": "",
+        "proven_directions": [],
+        "expansion_directions": [],
+        "experimental_directions": [],
+        "limitations": []
+      },
+      "items": [],
+      "alternates": [],
+      "rejected_candidates": [],
+      "unfilled_slots": [],
+      "editorial_warnings": [],
+      "handoff": {
+        "approval_required": true,
+        "ready_for_editorial_review": [],
+        "discovery_followup": [],
+        "production_blockers": []
+      }
+    },
+    {
+      "concept_id": "P001",
+      "revision": 1,
+      "origin": "new",
+      "approval_status": "pending_review",
+      "locked": false,
+      "source_idea_id": "D001",
+      "scheduled_at": "YYYY-MM-DDTHH:MM:SS+03:00",
+      "timezone": "Europe/Moscow",
+      "topic": "",
+      "cluster": "",
+      "content_format": "",
+      "working_headline": "",
+      "angle": "",
+      "key_thesis": "",
+      "reader_promise": "",
+      "audience_hook": "",
+      "editorial_rationale": "",
+      "primary_goal": "reach",
+      "strategy_role": "adjacent",
+      "analytics_observation_ids": [],
+      "analytics_experiment_ids": [],
+      "timing_rationale": "",
+      "initial_sources": [],
+      "research_brief": {
+        "objective": "",
+        "questions": [],
+        "claims_to_verify": [],
+        "essential_entities": [],
+        "selection_subjects": [],
+        "initial_source_ids": [],
+        "editorial_constraints": [],
+        "sufficiency_criteria": []
+      },
+      "risks": [],
+      "editorial_notes": ""
+    },
+    {
+      "source_id": "S001",
+      "title": "",
+      "url": "",
+      "supports": ""
+    },
+    {
+      "source_idea_id": "D006",
+      "working_headline": "",
+      "reason_to_keep": "",
+      "possible_replacement_for": [],
+      "limitations": []
+    },
+    {
+      "source_idea_id": "D007",
+      "reason_code": "duplicate",
+      "reason": ""
+    },
+    {
+      "reason_code": "insufficient_candidates",
+      "count": 1,
+      "details": "",
+      "suggested_discovery_direction": ""
+    }
+  ],
+  "research": [
+    {
+      "contract_version": "1.0",
+      "stage": "research",
+      "status": "ok",
+      "run_id": null,
+      "concept_id": "",
+      "concept_revision": 1,
+      "research_status": "ready",
+      "concept_validation": {
+        "original_thesis": "",
+        "thesis_status": "supported",
+        "assessment": "",
+        "proposed_change": null
+      },
+      "research_summary": {
+        "topic": "",
+        "angle": "",
+        "main_findings": [],
+        "most_valuable_details": [],
+        "editorial_opportunities": []
+      },
+      "works": [],
+      "people": [],
+      "facts": [],
+      "quotes": [],
+      "timeline": [],
+      "contradictions": [],
+      "excluded_claims": [],
+      "sources": [],
+      "article_structure": [],
+      "writer_handoff": {
+        "approved_fact_ids": [],
+        "approved_quote_ids": [],
+        "forbidden_claim_ids": [],
+        "mandatory_points": [],
+        "cautions": [],
+        "sufficiency": {
+          "target_length_chars": null,
+          "assessment": "",
+          "coverage": "sufficient",
+          "missing_sections": []
+        }
+      },
+      "research_limitations": [],
+      "followup_questions": []
+    },
+    {
+      "work_id": "W001",
+      "title": "",
+      "year": null,
+      "work_type": "film",
+      "director_names": [],
+      "lead_cast": [],
+      "production_notes": [],
+      "relevance_to_article": "",
+      "source_ids": [],
+      "fact_ids": []
+    },
+    {
+      "person_id": "A001",
+      "full_name": "",
+      "role_in_topic": "",
+      "related_work_ids": [],
+      "source_ids": [],
+      "notes": ""
+    },
+    {
+      "fact_id": "F001",
+      "claim": "",
+      "work_ids": [],
+      "person_ids": [],
+      "source_ids": [],
+      "evidence_type": "direct",
+      "confidence": "high",
+      "usage": "direct",
+      "importance": "core",
+      "context": "",
+      "qualification": null
+    },
+    {
+      "quote_id": "Q001",
+      "speaker": "",
+      "exact_text": "",
+      "original_language": "ru",
+      "source_ids": [],
+      "context": "",
+      "relevance": "",
+      "verification_status": "verified",
+      "usage": "direct",
+      "translation": null
+    },
+    {
+      "date": null,
+      "year": null,
+      "date_precision": "year",
+      "event": "",
+      "fact_ids": [],
+      "source_ids": []
+    },
+    {
+      "contradiction_id": "C001",
+      "subject": "",
+      "versions": [],
+      "resolution_status": "unresolved",
+      "assessment": "",
+      "writer_instruction": ""
+    },
+    {
+      "description": "",
+      "source_ids": []
+    },
+    {
+      "claim_id": "X001",
+      "claim": "",
+      "reason": "",
+      "source_ids": [],
+      "risk_level": "high"
+    },
+    {
+      "source_id": "S001",
+      "title": "",
+      "publisher": "",
+      "author": null,
+      "url": "",
+      "publication_date": null,
+      "source_type": "primary",
+      "retrieval_status": "full_text",
+      "independence_group": "",
+      "relevant_location": null,
+      "supports": [],
+      "reliability_note": ""
+    },
+    {
+      "section_id": "SEC001",
+      "section_purpose": "",
+      "main_point": "",
+      "fact_ids": [],
+      "quote_ids": [],
+      "work_ids": [],
+      "transition_note": ""
+    }
+  ],
+  "writer": [
+    {
+      "contract_version": "1.0",
+      "stage": "writer",
+      "status": "ok",
+      "run_id": null,
+      "concept_id": "",
+      "concept_revision": 1,
+      "content": {
+        "headline": "",
+        "article_markdown": "",
+        "character_count": null,
+        "comments_question": ""
+      },
+      "evidence_map": [],
+      "quotes_used": [],
+      "issues": [],
+      "handoff": {
+        "ready_for_qa": false,
+        "needs_research": [],
+        "needs_editorial_decision": []
+      }
+    },
+    {
+      "fact_id": "F001",
+      "anchor_text": ""
+    },
+    {
+      "quote_id": "Q001",
+      "anchor_text": ""
+    },
+    {
+      "code": "insufficient_facts",
+      "severity": "high",
+      "description": "",
+      "related_fact_ids": []
+    }
+  ],
+  "image": [
+    {
+      "contract_version": "1.0",
+      "stage": "image",
+      "status": "ok",
+      "run_id": null,
+      "concept_id": "",
+      "concept_revision": 1,
+      "visual_plan": {
+        "expected_inline_images": 0,
+        "selected_inline_images": 0,
+        "missing_sections": []
+      },
+      "cover": {
+        "status": "ready",
+        "source_asset_id": null,
+        "cover_asset_id": null,
+        "cover_text": "",
+        "width": 1600,
+        "height": 900,
+        "aspect_ratio": "16:9",
+        "layout_description": "",
+        "validation_issues": []
+      },
+      "assets": [],
+      "placements": [],
+      "assembly": {
+        "status": "ready",
+        "headline": "",
+        "original_content_hash": null,
+        "assembled_document_ref": null,
+        "assembly_version": 1,
+        "visible_captions": false,
+        "cover_in_body": true,
+        "validation_issues": []
+      },
+      "publishing_handoff": {
+        "requested_action": "create_draft",
+        "execution_status": "not_attempted",
+        "draft_id": null,
+        "draft_url": null,
+        "verified_in_dzen": false,
+        "issues": []
+      },
+      "issues": []
+    },
+    {
+      "asset_id": "IMG001",
+      "media_type": "film_still",
+      "related_work_id": null,
+      "related_section_id": null,
+      "source_page_url": "",
+      "source_image_url": null,
+      "source_name": "",
+      "attribution": null,
+      "rights_status": "requires_review",
+      "authenticity_status": "verified",
+      "authenticity_basis": "",
+      "local_file_ref": null,
+      "file_hash": null,
+      "width": null,
+      "height": null,
+      "download_status": "not_attempted",
+      "selection_rationale": "",
+      "issues": []
+    },
+    {
+      "placement_id": "PL001",
+      "asset_id": "IMG001",
+      "role": "inline",
+      "target_section_heading": "",
+      "anchor_text": "",
+      "occurrence_index": 0,
+      "placement_rule": "after_cast_block",
+      "visible_caption": null,
+      "alt_text": "",
+      "status": "ready"
+    }
+  ]
+}

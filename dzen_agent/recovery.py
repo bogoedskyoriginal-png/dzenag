@@ -33,7 +33,7 @@ def refresh_pending_config(store, run_id: int) -> None:
             raise ValueError("Нет незавершённого запуска.")
         old = json.loads(run["settings_json"])
         current = store.settings()
-        keys = ["analytics_model", "discovery_model", "research_model", "planner_model", "writer_model", "image_model",
+        keys = ["analytics_model", "discovery_model", "research_model", "planner_model", "writer_model", "image_model", "visual_model",
                 "research_use_web_tool", "max_output_tokens", "image_quality", "max_retries"]
         old.update({key: current[key] for key in keys})
         store.execute("UPDATE pipeline_runs SET settings_json=?,prompts_json=? WHERE id=?",

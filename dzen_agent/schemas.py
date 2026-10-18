@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 from dzen_agent.analytics_contract import Analytics as Analytics, LegacyAnalytics as LegacyAnalytics
+from dzen_agent.editorial_contracts import PlanItem, ResearchV1
 
 
 class Output(BaseModel):
@@ -65,6 +66,7 @@ class Research(Output):
     contradictions: list[str]
     uncertainty: list[str]
     suggested_angles: list[str]
+    editorial_contract: ResearchV1 | None = None
 
 
 class Concept(Output):
@@ -80,6 +82,7 @@ class Concept(Output):
     suggested_publication_date: str
     suggested_publication_time: str
     score: float = Field(ge=0, le=100)
+    editorial_contract: PlanItem | None = None
 
 
 class Plan(Output):
@@ -141,4 +144,4 @@ class EditorialProposal(Output):
 
 class EditorialReply(Output):
     message: str = Field(min_length=1, max_length=12000)
-    proposals: list[EditorialProposal] = Field(default_factory=list, max_length=10)
+    proposals: list[EditorialProposal] = Field(default_factory=list, max_length=42)

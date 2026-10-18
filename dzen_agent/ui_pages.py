@@ -8,6 +8,7 @@ from uuid import uuid4
 import streamlit as st
 
 from dzen_agent import scheduler
+from dzen_agent.editorial_pipeline import native
 from dzen_agent.browser.scheduling import DzenScheduling, UNVERIFIED
 from dzen_agent.browser.session import launch_session
 from dzen_agent.browser.statistics_download import STATUS as CSV_DOWNLOAD_STATUS
@@ -19,7 +20,7 @@ from dzen_agent.plan_review import approve_plan, editing_reason, is_approved
 from dzen_agent.prompt_service import PROMPT_TYPES, VARIABLES, Prompts
 from dzen_agent.provider import AITunnel, choose_defaults, fetch_catalog
 from dzen_agent.recovery import authorize_retry, refresh_pending_config, restart_analytics
-from dzen_agent.services import ContentService, qa_article
+from dzen_agent.services import ContentService, qa_article, week_slots
 from dzen_agent.statistics import ALIASES, import_csv, preview_csv
 from dzen_agent.store import MSK, dumps, now_iso
 
@@ -150,7 +151,12 @@ def dashboard(store, config):
     st.info("Автоматическая постановка в отложенные пока не проверена на вашем канале. "
             "Подготовка материалов и V0-заполнение редактора доступны.")
     st.caption("План операций для новой недели:")
-    st.json(estimate_operations(settings))
+    operations = estimate_operations(settings)
+    if native(Prompts(store).active("IMAGE"), "image"):
+        operations.pop("Изображения", None)
+        operations.update({"Поиск фотографий": settings["max_articles_per_week"],
+                           "Просмотр и выбор фотографий (максимум)": settings["max_articles_per_week"]})
+    st.json(operations)
     if st.button("Подготовить неделю", type="primary", disabled=settings["stop_requested"]):
         def launch():
             run_id = create_run(store)
@@ -238,6 +244,15 @@ def content_plan(store, config):
                            next(p["week_start"] for p in plans if p["id"] == value))
     run_id = next(p["run_id"] for p in plans if p["id"] == plan_id)
     plan = next(p for p in plans if p["id"] == plan_id)
+    schedule_rows = store.rows("SELECT scheduled_at,topic,status FROM concepts WHERE plan_id=? ORDER BY scheduled_at,id", (plan_id,))
+    st.dataframe([{"Дата": datetime.fromisoformat(r["scheduled_at"]).astimezone(MSK).strftime("%d.%m.%Y"),
+                   "Время (Москва)": datetime.fromisoformat(r["scheduled_at"]).astimezone(MSK).strftime("%H:%M"),
+                   "Тема": r["topic"], "Статус": r["status"]} for r in schedule_rows], hide_index=True, use_container_width=True)
+    saved_plan = json.loads(plan.get("payload_json") or "{}")
+    for warning in saved_plan.get("editorial_warnings", []):
+        st.warning(warning)
+    for missing in saved_plan.get("unfilled_slots", []):
+        st.warning(f"Не заполнено мест: {missing['count']}. {missing['details']}")
     left, right = st.columns([3, 2], gap="large")
     with left:
         reason = editing_reason(store, plan_id)
@@ -358,11 +373,40 @@ def articles_page(store, config):
     if image and Path(image["path"]).is_file():
         st.image(image["path"], width=550)
         st.caption(f"Источник: {image['origin']} · {image.get('model') or 'ваша картинка'}")
-    if st.button("Сгенерировать заново" if image else "Сгенерировать обложку",
+    native_image = native(Prompts(store).active("IMAGE"), "image")
+    image_label = "Подобрать фото и собрать оформление" if native_image else (
+        "Сгенерировать заново" if image else "Сгенерировать обложку")
+    if st.button(image_label,
                  disabled=not config.aitunnel_api_key):
         if action("Генерирую обложку…", lambda: service(store, config).image(
                 article_id, "image:" + uuid4().hex, force=True)):
             st.rerun()
+    visual = store.one("SELECT payload_json FROM visual_results WHERE article_id=? ORDER BY id DESC LIMIT 1", (article_id,))
+    if visual:
+        result = json.loads(visual["payload_json"])
+        st.caption("Визуальное оформление: " + result["status"])
+        for issue in result.get("issues", []) + result["assembly"]["validation_issues"]:
+            st.warning(issue)
+        with st.expander("Иллюстрации и источники фотографий"):
+            for asset in result["assets"]:
+                st.write(asset["asset_id"], asset["source_name"], asset["authenticity_status"], asset["rights_status"])
+                st.link_button("Страница источника · " + asset["asset_id"], asset["source_page_url"])
+                if asset.get("local_file_ref") and Path(asset["local_file_ref"]).is_file():
+                    st.image(asset["local_file_ref"], width=400)
+                for issue in asset.get("issues", []):
+                    st.caption(issue)
+        document_ref = result["assembly"].get("assembled_document_ref")
+        if document_ref and Path(document_ref).is_file():
+            with st.expander("Готовая статья с иллюстрациями"):
+                document = json.loads(Path(document_ref).read_text(encoding="utf-8"))
+                st.subheader(document["headline"])
+                for block in document["blocks"]:
+                    if block["type"] == "text":
+                        st.markdown(block["markdown"])
+                    elif Path(block["local_file_ref"]).is_file():
+                        st.image(block["local_file_ref"], use_container_width=True)
+            st.download_button("Скачать собранную статью с описанием размещения изображений", Path(document_ref).read_bytes(),
+                               file_name=f"article-{article_id}.json", mime="application/json")
     own_image = st.file_uploader("Загрузить свою картинку", type=["png", "jpg", "jpeg", "webp"],
                                  key=f"image-upload-{article_id}")
     if own_image and st.button("Использовать мою картинку"):
@@ -375,10 +419,7 @@ def articles_page(store, config):
         time_value = st.time_input("Время публикации (Москва)", value=scheduled.time())
         if st.form_submit_button("Сохранить дату и время"):
             value = datetime.combine(date_value, time_value, tzinfo=MSK).isoformat()
-            store.execute("UPDATE article_details SET scheduled_at=?,qa_json=NULL WHERE article_id=?",
-                           (value, article_id))
-            invalidate_approval(store, article_id)
-            st.success("Дата сохранена; требуется новая проверка QA.")
+            action("Сохраняю расписание…", lambda: service(store, config).set_schedule(article_id, value))
     if st.button("Проверить статью (QA)"):
         result = action("Проверяю…", lambda: qa_article(store, article_id))
         if result:
@@ -461,10 +502,14 @@ def models_page(store, config):
         st.caption("Каталог обновлён: " + settings.get("catalog_updated_at", "неизвестно"))
     with st.form("model_settings"):
         selected = {}
-        for role in ("analytics", "discovery", "research", "planner", "writer", "image"):
+        native_image = native(Prompts(store).active("IMAGE"), "image")
+        roles = ("analytics", "discovery", "research", "planner", "writer", "visual" if native_image else "image")
+        for role in roles:
             group = "images" if role == "image" else "chat"
             options = list(catalog.get(group, {}))
-            current = settings[role + "_model"] or (settings["research_model"] if role == "discovery" else "")
+            if role == "visual":
+                options = [key for key in options if "image" in catalog[group][key].get("modalities", {}).get("input", [])]
+            current = settings.get(role + "_model") or (settings["research_model"] if role in ("discovery", "visual") else "")
             if current and current not in options:
                 options.insert(0, current)
             if options:
@@ -498,11 +543,11 @@ def models_page(store, config):
     with st.form("agent_settings"):
         values = {"channel_topic": st.text_input("Тематика и аудитория канала", settings["channel_topic"])}
         values["dzen_editor_url"] = st.text_input("Адрес редактора статьи в вашем канале", settings["dzen_editor_url"])
-        numeric = [("max_articles_per_week", "Статей в неделю", 1, 7),
+        numeric = [("max_articles_per_week", "Статей в неделю", 1, 21),
                    ("max_research_calls_per_article", "Исследований на статью (максимум)", 1, 3),
                    ("max_retries", "Повторов после ограничения частоты API", 0, 3),
                    ("statistics_max_age_days", "Срок актуальности импорта, дней", 1, 90),
-                   ("max_output_tokens", "Лимит выходных токенов", 1000, 32000)]
+                   ("max_output_tokens", "Лимит выходных токенов", 1000, 128000)]
         for key, label, low, high in numeric:
             values[key] = st.number_input(label, low, high, int(settings[key]))
         for key, label in [("monthly_soft_budget_rub", "Локальный бюджет за 30 дней, ₽"),
@@ -512,14 +557,31 @@ def models_page(store, config):
             default=settings["publication_days"], format_func=lambda day: DAYS[day])
         values["publication_time"] = st.time_input("Время публикаций (Москва)",
             time.fromisoformat(settings["publication_time"])).strftime("%H:%M")
+        slot_text = st.text_input("Временные слоты по Москве через запятую",
+            value=", ".join(settings.get("publication_times") or [settings["publication_time"]]),
+            help="Например: 09:00, 14:00, 19:00. Для 21 статьи выберите 7 дней и 3 слота.")
+        values["publication_times"] = [x.strip() for x in slot_text.split(",") if x.strip()]
+        values["max_articles_per_day"] = st.number_input("Максимум публикаций в день", 1, 21,
+            int(settings.get("max_articles_per_day", max(1, len(values["publication_times"])))))
+        individual = st.checkbox("Настроить отдельные слоты по дням", bool(settings.get("publication_slots")))
+        values["publication_slots"] = {}
+        if individual:
+            for day in values["publication_days"]:
+                day_times = st.text_input(DAYS[day] + " · слоты", value=", ".join(
+                    (settings.get("publication_slots") or {}).get(str(day), values["publication_times"])))
+                values["publication_slots"][str(day)] = [x.strip() for x in day_times.split(",") if x.strip()]
+        st.caption("Стандарт канала: 05:00, 06:00, 16:00 по Москве. Настройки применяются к новым неделям.")
         values["ai_qa_enabled"] = st.checkbox("Дополнительный платный AI-QA", settings["ai_qa_enabled"])
         if st.form_submit_button("Сохранить настройки"):
-            if len(values["publication_days"]) < values["max_articles_per_week"]:
-                st.error("Выберите не меньше дней, чем статей в неделю.")
-            else:
+            try:
+                if not values["publication_times"]:
+                    raise ValueError("Укажите хотя бы один временной слот.")
+                week_slots("2099-01-05", {**settings, **values})
                 for key, value in values.items():
                     store.set_setting(key, value)
                 st.success("Настройки сохранены.")
+            except ValueError as error:
+                st.error(str(error))
 
 
 def autopilot_page(store, config):

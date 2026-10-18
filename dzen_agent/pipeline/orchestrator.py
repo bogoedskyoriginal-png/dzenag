@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta
 
 from dzen_agent.errors import UserActionRequired, log_exception, redact
+from dzen_agent import editorial_pipeline
 from dzen_agent.analytics_contract import briefs, parse_analytics
 from dzen_agent.locking import exclusive_lock
 from dzen_agent.models import ArticleStatus
@@ -49,6 +50,10 @@ def create_run(store: Store, week: str | None = None) -> int:
     slots = week_slots(week, settings)
     if any(datetime.fromisoformat(slot) <= datetime.now(MSK) for slot in slots):
         raise ValueError("Выберите будущую неделю.")
+    occupied = store.rows("SELECT scheduled_at FROM concepts UNION SELECT scheduled_at FROM article_details "
+                          "WHERE scheduled_at IS NOT NULL")
+    if {datetime.fromisoformat(x["scheduled_at"]) for x in occupied} & {datetime.fromisoformat(x) for x in slots}:
+        raise ValueError("В расписании уже есть статьи или концепты на выбранное время. Измените слоты новой недели.")
     Prompts(store).seed()
     with store._connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -91,6 +96,8 @@ class Pipeline:
                            "ended_at=NULL,error=NULL WHERE id=?", (now_iso(), run_id))
         stage = "COLLECT_STATS"
         try:
+            if settings.get("pipeline_flow") == "analytics_v1":
+                editorial_pipeline.preflight(settings, json.loads(run["prompts_json"]))
             for stage in stages_for(settings):
                 self._check_stop()
                 record = self.store.one("SELECT * FROM pipeline_stages WHERE run_id=? AND stage=?",
@@ -99,7 +106,8 @@ class Pipeline:
                     plan = self.store.one("SELECT * FROM content_plans WHERE run_id=?", (run_id,))
                     if not plan:
                         raise UserActionRequired("Контент-план ещё не сохранён. Завершите этап PLAN.")
-                    if self.store.settings()["mode"] != "AUTOPILOT" and not is_approved(plan):
+                    native_research = editorial_pipeline.native(json.loads(run["prompts_json"]).get("RESEARCH"), "research")
+                    if (native_research or self.store.settings()["mode"] != "AUTOPILOT") and not is_approved(plan):
                         return self._wait(run_id, stage, "AWAITING_PLAN_REVIEW",
                                           "Контент-план готов. Проверьте идеи перед созданием статей.")
                 if record["status"] == "SUCCEEDED":
@@ -256,10 +264,14 @@ class Pipeline:
             payload = json.loads(concept["payload_json"])
             query = concept["topic"] + "\nРедакционный ракурс: " + payload["angle"]
             fresh = concept["research_version"] > 0
-            research_id = service.research(
-                query, analytics, key + f":refresh:{concept['id']}:v{concept['research_version']}",
-                cache_topic=f"{concept['topic']} [груминг {concept['id']} v{concept['research_version']}]" if fresh else concept["topic"],
-            )
+            if editorial_pipeline.native(service.prompts.get("RESEARCH"), "research"):
+                research_id = editorial_pipeline.research(service, concept,
+                    key + f":refresh:{concept['id']}:v{concept['research_version']}")
+            else:
+                research_id = service.research(
+                    query, analytics, key + f":refresh:{concept['id']}:v{concept['research_version']}",
+                    cache_topic=f"{concept['topic']} [груминг {concept['id']} v{concept['research_version']}]" if fresh else concept["topic"],
+                )
             research = self.store.one("SELECT * FROM research_jobs WHERE id=?", (research_id,))
             if not research or research["status"] != "sufficient":
                 raise UserActionRequired("Новое исследование не подтвердило изменённую тему.")

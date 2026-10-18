@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from datetime import datetime, timedelta
 
 from dzen_agent.errors import UserActionRequired
@@ -57,6 +58,24 @@ def changed_concept(row, proposal: EditorialProposal, week_start: str) -> tuple[
     payload = Concept.model_validate(payload).model_dump(mode="json")
     fresh = (proposal.type == "replace_concept" or normalize(old_topic) != normalize(payload["topic"])
              or normalize(old_angle) != normalize(payload["angle"]))
+    if payload.get("editorial_contract"):
+        item = payload["editorial_contract"]
+        if proposal.type == "replace_concept":
+            payload["thesis"] = proposal.thesis or proposal.angle
+            payload["audience_value"] = proposal.audience_value or proposal.new_topic
+            payload["why_now"] = proposal.why_now or "Новая тема предложена редактором."
+            payload["key_points"] = proposal.key_points or [
+                f"Проверить тему «{proposal.new_topic}» и ракурс «{proposal.angle}» по независимым источникам."]
+        item.update(topic=payload["topic"], working_headline=payload["working_title"], angle=payload["angle"],
+                    key_thesis=payload["thesis"], reader_promise=payload["audience_value"],
+                    scheduled_at=scheduled_at, approval_status="pending_review", revision=row["revision"] + 1)
+        if proposal.type == "replace_concept":
+            item.update(source_idea_id=None, initial_sources=[])
+            item["research_brief"].update(initial_source_ids=[], essential_entities=[], selection_subjects=[])
+        item["research_brief"].update(objective=payload["topic"] + ": " + payload["angle"],
+                                     questions=payload["key_points"])
+        # Native dossiers are pinned to the full concept revision, including editorial changes.
+        fresh = True
     return payload, scheduled_at, fresh
 
 
@@ -87,6 +106,10 @@ def proposal_preview(store: Store, plan_id: int, suggestion: dict) -> dict:
 
 def _validate_final_slots(conn, plan, rows):
     occupied = set()
+    run = conn.execute("SELECT settings_json FROM pipeline_runs WHERE id=?", (plan["run_id"],)).fetchone()
+    settings = json.loads(run["settings_json"])
+    maximum = settings.get("max_articles_per_day", max(1, len(settings.get("publication_times") or [])))
+    daily = Counter(datetime.fromisoformat(row["scheduled_at"]).astimezone(MSK).date() for row in rows)
     for row in rows:
         _validate_slot(row["scheduled_at"], plan["week_start"])
         canonical = datetime.fromisoformat(row["scheduled_at"]).astimezone(MSK).isoformat()
@@ -99,6 +122,8 @@ def _validate_final_slots(conn, plan, rows):
         if any(datetime.fromisoformat(s["scheduled_at"]) == datetime.fromisoformat(canonical)
                for s in list(other) + list(article_slots)):
             raise ValueError("Это время уже занято другой статьёй или контент-планом.")
+    if any(count > maximum for count in daily.values()):
+        raise ValueError("Превышено максимальное число публикаций в день для этой недели.")
 
 
 def apply_proposals(store: Store, message_id: int, indices: list[int]) -> None:

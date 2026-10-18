@@ -42,7 +42,7 @@ def test_v1_editorial_migration_keeps_existing_plan_and_articles(tmp_path):
     assert len(store.rows("SELECT * FROM pipeline_stages WHERE stage IN ('PLAN_REVIEW','REFRESH_RESEARCH')")) == 2
     assert all(row["status"] == "SUCCEEDED" for row in store.rows("SELECT status FROM pipeline_stages"))
     assert len(list((tmp_path / "backups").glob('*.db'))) == 1
-    assert store.one("PRAGMA user_version")["user_version"] == 3
+    assert store.one("PRAGMA user_version")["user_version"] == 4
     assert store.one("PRAGMA foreign_key_check") is None
     store.execute("INSERT INTO editorial_chat_messages(plan_id,role,content,created_at) VALUES(9,'user','Сохранено','now')")
     reopened = Store(path)
@@ -69,6 +69,6 @@ def test_v2_to_v3_keeps_raw_analytics_prompt_and_run_snapshot(tmp_path):
     assert store.rows("SELECT * FROM prompt_versions") == before
     assert store.one("SELECT payload_json,superseded FROM analytics_results") == {"payload_json": original, "superseded": 0}
     assert store.one("SELECT settings_json FROM pipeline_runs")["settings_json"] == "{}"
-    assert store.one("PRAGMA user_version")["user_version"] == 3
+    assert store.one("PRAGMA user_version")["user_version"] == 4
     assert store.one("PRAGMA integrity_check")["integrity_check"] == "ok"
     assert len(list((tmp_path / "backups").glob('*.db'))) == 1

@@ -6,12 +6,14 @@ import re
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 from pydantic import ValidationError
 
 from dzen_agent.analytics_contract import analytics_summary, briefs, parse_analytics
 from dzen_agent.analytics_input import build_analytics_input
+from dzen_agent import editorial_pipeline
 from dzen_agent.errors import UserActionRequired
 from dzen_agent.database import _invalidate_run
 from dzen_agent.models import ArticleStatus
@@ -32,15 +34,31 @@ def similar(first: str, second: str) -> bool:
 
 def week_slots(week_start: str, settings: dict) -> list[str]:
     start = datetime.fromisoformat(week_start).replace(tzinfo=MSK)
-    hour, minute = map(int, settings["publication_time"].split(":"))
     days = sorted(set(settings["publication_days"]))
     count = settings["max_articles_per_week"]
-    if not days or count > len(days):
-        raise ValueError("Выберите достаточно дней публикации: один материал в день.")
-    if any(day not in range(7) for day in days) or not (0 <= hour < 24 and 0 <= minute < 60):
+    times = settings.get("publication_times") or [settings["publication_time"]]
+    overrides = settings.get("publication_slots") or {}
+    if any(str(day) not in {str(i) for i in range(7)} for day in overrides):
+        raise ValueError("Неверный день в индивидуальном расписании.")
+    if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 21:
+        raise ValueError("Допустимо от 1 до 21 статьи в неделю.")
+    if any(day not in range(7) for day in days) or not days:
         raise ValueError("Неверные дни или время публикации.")
-    return [(start + timedelta(days=day)).replace(hour=hour, minute=minute).isoformat()
-            for day in days[:count]]
+    try:
+        parsed_by_day = {day: [datetime.strptime(value, "%H:%M").time()
+            for value in overrides.get(str(day), times)] for day in days}
+    except (ValueError, TypeError) as error:
+        raise ValueError("Временные слоты указываются в формате HH:MM.") from error
+    if any(len(set(parsed)) != len(parsed) for parsed in parsed_by_day.values()):
+        raise ValueError("Временные слоты не должны повторяться.")
+    max_daily = int(settings.get("max_articles_per_day", max(map(len, parsed_by_day.values()))))
+    if not 1 <= max_daily <= 21 or any(len(parsed) > max_daily for parsed in parsed_by_day.values()):
+        raise ValueError("Число временных слотов превышает лимит публикаций в день.")
+    if count > sum(map(len, parsed_by_day.values())):
+        raise ValueError("Добавьте дни или временные слоты для выбранного числа статей.")
+    slots = [(start + timedelta(days=day)).replace(hour=t.hour, minute=t.minute).isoformat()
+             for day in days for t in sorted(parsed_by_day[day])]
+    return slots[:count]
 
 
 def citation_urls(response: dict) -> set[str]:
@@ -89,10 +107,10 @@ class ContentService:
                 "channel_topic": self.settings["channel_topic"],
                 "today": datetime.now(MSK).date().isoformat(), **extra}
 
-    def structured(self, kind, schema, context, call_key, *, article_id=None, operation=None):
+    def structured(self, kind, schema, context, call_key, *, article_id=None, operation=None, image_inputs=None):
         model_key = {"ANALYTICS": "analytics_model", "DISCOVERY": "discovery_model", "RESEARCH": "research_model",
-                     "PLANNER": "planner_model", "WRITER": "writer_model"}[kind]
-        model = self.settings.get(model_key) or (self.settings.get("research_model") if kind == "DISCOVERY" else None)
+                     "PLANNER": "planner_model", "WRITER": "writer_model", "IMAGE": "visual_model"}[kind]
+        model = self.settings.get(model_key) or (self.settings.get("research_model") if kind in ("DISCOVERY", "IMAGE") else None)
         if not model:
             raise UserActionRequired("Выберите модели в разделе «Настройки / Модели».")
         prompt = self.prompts.get(kind)
@@ -106,7 +124,8 @@ class ContentService:
                 "history": context["editorial_context"].get("recent_publications", []),
                 "channel_topic": context["editorial_context"]["channel_topic"]}
         system = render(prompt["content"], template_values)
-        system += (("\n\nСхема согласованного Analytics 1.0 для программной валидации:\n" if schema is Analytics else
+        native_contract = schema is Analytics or schema.__module__ == "dzen_agent.editorial_contracts"
+        system += (("\n\nСхема согласованного JSON-контракта для программной валидации:\n" if native_contract else
                    "\n\nТехнический контракт приложения: итоговый ответ — только JSON по схеме ниже. "
                    "Этот контракт заменяет прежние требования к форме JSON, сохраняя редакционные "
                    "инструкции. Используй только переданные или найденные источники.\n")
@@ -128,9 +147,14 @@ class ContentService:
             "response_format": {"type": "json_object"},
             "max_tokens": int(self.settings["max_output_tokens"]),
         }
-        if schema is Analytics:
+        model_limit = self.settings.get("public_catalog", {}).get("chat", {}).get(model, {}).get("max_output")
+        if isinstance(model_limit, int) and model_limit > 0:
+            payload["max_tokens"] = min(payload["max_tokens"], model_limit)
+        if native_contract:
             payload["messages"][1]["content"] = dumps(context)
-        if kind in ("RESEARCH", "DISCOVERY") and self.settings.get("research_use_web_tool"):
+        if image_inputs:
+            payload["messages"][1]["content"] = [{"type": "text", "text": dumps(context)}, *image_inputs]
+        if kind in ("RESEARCH", "DISCOVERY", "IMAGE") and not image_inputs and self.settings.get("research_use_web_tool"):
             payload["tools"] = [{"type": "aitunnel:web_search", "parameters": {"max_uses": 1}}]
             payload["max_tool_calls"] = 1
         response = self.provider.call(
@@ -165,6 +189,11 @@ class ContentService:
                                   self.prompts["ANALYTICS"]["id"], now_iso()))
 
     def discover(self, analytics: dict, call_key: str) -> int:
+        parsed = parse_analytics(analytics)
+        if isinstance(parsed, Analytics) and parsed.status == "insufficient_data":
+            raise UserActionRequired("Analytics: недостаточно данных. Исправьте импорт перед платным Discovery.")
+        if editorial_pipeline.native(self.prompts.get("DISCOVERY"), "discovery"):
+            return editorial_pipeline.discover(self, analytics, call_key)
         existing = self.store.one("SELECT * FROM discovery_results WHERE run_id=?", (self.run_id,))
         revision = int(self.settings.get("analysis_revision", 0))
         if existing and existing["analysis_revision"] == revision:
@@ -204,6 +233,9 @@ class ContentService:
         return result_id
 
     def research(self, topic: str, analytics: dict, call_key: str, *, cache_topic: str | None = None) -> int:
+        if editorial_pipeline.native(self.prompts.get("RESEARCH"), "research"):
+            raise UserActionRequired("Авторский Research запускается из утверждённого контент-плана, "
+                                     "с концептом и Research Brief. Сначала утвердите план.")
         # Editorial revisions need their own durable identity even when only the angle changed.
         cache_topic = cache_topic or topic
         existing = self.store.one("SELECT * FROM research_jobs WHERE run_id=? AND topic=?",
@@ -282,6 +314,8 @@ class ContentService:
         return plan_id
 
     def plan_from_discovery(self, analytics: dict, discovery: dict, week_start: str, call_key: str) -> int:
+        if editorial_pipeline.native(self.prompts.get("PLANNER"), "planner"):
+            return editorial_pipeline.plan(self, analytics, discovery, week_start, call_key)
         existing = self.store.one("SELECT id FROM content_plans WHERE run_id=?", (self.run_id,))
         if existing:
             return existing["id"]
@@ -336,24 +370,37 @@ class ContentService:
         if not row or row["status"] != "sufficient":
             raise UserActionRequired("Сначала выполните исследование с проверенными источниками.")
         research = json.loads(row["payload_json"])
+        if article_id and not concept_row:
+            existing_detail = self.store.detail(article_id)
+            concept_row = self.store.one("SELECT * FROM concepts WHERE id=?", (existing_detail.get("concept_id"),))
         concept = json.loads(concept_row["payload_json"]) if concept_row else {"topic": topic}
         existing_article = self.store.get(article_id) if article_id else None
         output_schema = NewTitle if part == "title" else NewBody if part == "body" else WrittenArticle
-        result, _ = self.structured("WRITER", output_schema, self.context(
-            topic=topic, concept=concept, research=research, sources=research["sources"],
-            article_title=existing_article.title if existing_article else "",
-            article_body=existing_article.body if existing_article else "",
-            publication_date=concept_row["scheduled_at"] if concept_row else "",
-        ), call_key, article_id=article_id)
+        writer_contract = None
+        if editorial_pipeline.native(self.prompts.get("WRITER"), "writer"):
+            if not concept_row:
+                raise UserActionRequired("Авторский Writer требует утверждённый концепт и готовый Research.")
+            result, writer_contract = editorial_pipeline.write(self, concept_row, research, call_key, existing_article, part)
+        else:
+            result, _ = self.structured("WRITER", output_schema, self.context(
+                topic=topic, concept=concept, research=research, sources=research["sources"],
+                article_title=existing_article.title if existing_article else "",
+                article_body=existing_article.body if existing_article else "",
+                publication_date=concept_row["scheduled_at"] if concept_row else "",
+            ), call_key, article_id=article_id)
         if existing_article and part != "all":
             existing_detail = self.store.detail(article_id)
+            changes = result.model_dump()
+            if writer_contract:
+                changes = {"title": result.title} if part == "title" else {
+                    "body": result.body, "short_summary": result.short_summary, "source_ids": result.source_ids}
             result = WrittenArticle.model_validate({
                 "title": existing_article.title,
                 "body": existing_article.body,
                 "short_summary": existing_detail.get("short_summary") or existing_article.body[:400],
                 "source_ids": json.loads(existing_detail.get("source_ids_json") or "[]")
                 or [s["id"] for s in research["sources"]],
-                **result.model_dump(),
+                **changes,
             })
         if not result.title.strip() or not result.body.strip():
             raise UserActionRequired("Модель вернула пустой материал.")
@@ -369,7 +416,7 @@ class ContentService:
                                (result.short_summary, dumps(result.source_ids),
                                 dumps({"model": self.settings["writer_model"],
                                        "prompt_version": self.prompts["WRITER"]["id"],
-                                       "call_key": call_key}), article_id))
+                                       "call_key": call_key, "writer_contract": writer_contract}), article_id))
             return article_id
         stamp = now_iso()
         with self.store._connect() as conn:
@@ -382,13 +429,17 @@ class ContentService:
                          "VALUES(?,?,?,?,?,?,?,?)", (article_id, concept_row["id"] if concept_row else
                          None, research_id, self.run_id, result.short_summary,
                          dumps(result.source_ids), dumps({"model": self.settings["writer_model"],
-                         "prompt_version": self.prompts["WRITER"]["id"], "call_key": call_key}),
+                         "prompt_version": self.prompts["WRITER"]["id"], "call_key": call_key,
+                         "writer_contract": writer_contract}),
                          concept_row["scheduled_at"] if concept_row else None))
             conn.execute("UPDATE usage_events SET article_id=? WHERE call_key=?",
                          (article_id, call_key))
         return article_id
 
     def image(self, article_id: int, call_key: str, *, force=False) -> int:
+        if editorial_pipeline.native(self.prompts.get("IMAGE"), "image"):
+            from dzen_agent.visuals import prepare_visuals
+            return prepare_visuals(self, article_id, call_key, force=force)
         active = self.store.active_image(article_id)
         if active and Path(active["path"]).is_file() and not force:
             return active["id"]
@@ -421,6 +472,37 @@ class ContentService:
     def upload_image(self, article_id: int, raw: bytes) -> int:
         path = self.store.database_path.parent / "images" / str(article_id) / f"user-{uuid4().hex}.png"
         return self.attach_image(article_id, save_image_bytes(raw, path), origin="USER")
+
+    def set_schedule(self, article_id: int, value: str) -> None:
+        scheduled = datetime.fromisoformat(value)
+        if scheduled.tzinfo is None or scheduled <= datetime.now(MSK):
+            raise ValueError("Выберите будущее время с часовым поясом.")
+        value = scheduled.astimezone(MSK).isoformat()
+        with self.store._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            detail = conn.execute("SELECT * FROM article_details WHERE article_id=?", (article_id,)).fetchone()
+            if not detail:
+                raise ValueError("Статья не найдена.")
+            occupied = conn.execute("SELECT scheduled_at FROM article_details WHERE article_id<>? "
+                "AND scheduled_at IS NOT NULL UNION SELECT scheduled_at FROM concepts WHERE id<>?",
+                (article_id, detail["concept_id"] or -1)).fetchall()
+            if any(datetime.fromisoformat(row["scheduled_at"]) == scheduled for row in occupied):
+                raise ValueError("Это время уже занято другой статьёй или концептом.")
+            day_count = len({datetime.fromisoformat(row["scheduled_at"]).astimezone(MSK) for row in occupied
+                             if datetime.fromisoformat(row["scheduled_at"]).astimezone(MSK).date() == scheduled.astimezone(MSK).date()})
+            maximum = self.settings.get("max_articles_per_day", max(1, len(self.settings.get("publication_times") or [])))
+            if day_count + 1 > maximum:
+                raise ValueError("Превышено максимальное число публикаций в день.")
+            conn.execute("UPDATE article_details SET scheduled_at=?,qa_json=NULL WHERE article_id=?", (value, article_id))
+            concept = conn.execute("SELECT payload_json FROM concepts WHERE id=?", (detail["concept_id"],)).fetchone()
+            if concept:
+                payload = json.loads(concept["payload_json"])
+                payload.update(suggested_publication_date=value[:10], suggested_publication_time=value[11:16])
+                if payload.get("editorial_contract"):
+                    payload["editorial_contract"]["scheduled_at"] = value
+                conn.execute("UPDATE concepts SET scheduled_at=?,payload_json=? WHERE id=?",
+                             (value, dumps(payload), detail["concept_id"]))
+            _invalidate_run(conn, article_id)
 
     def attach_image(self, article_id, path, *, model=None, prompt_version=None, cost=None,
                      origin="AI") -> int:
@@ -459,6 +541,45 @@ def qa_article(store: Store, article_id: int) -> dict:
         issues.append("Пустой текст.")
     if not image or not Path(image["path"]).is_file():
         issues.append("Нет файла обложки.")
+    metadata = json.loads(detail.get("metadata_json") or "{}")
+    if metadata.get("writer_contract"):
+        from dzen_agent.visuals import validate_visuals
+        from dzen_agent.editorial_contracts import WriterV1, ResearchV1
+        from dzen_agent.plan_review import is_approved
+        try:
+            concept = store.one("SELECT * FROM concepts WHERE id=?", (detail.get("concept_id"),))
+            plan = store.one("SELECT * FROM content_plans WHERE id=?", (concept["plan_id"],)) if concept else None
+            writer = WriterV1.model_validate(metadata["writer_contract"])
+            writer.content.article_markdown = article.body
+            writer.content.headline = article.title
+            job = store.one("SELECT payload_json FROM research_jobs WHERE id=?", (detail.get("research_id"),))
+            dossier = ResearchV1.model_validate(json.loads(job["payload_json"])["editorial_contract"])
+            writer.validate_research(dossier)
+            if not plan or not is_approved(plan) or concept["revision"] != writer.concept_revision:
+                issues.append("Материал не соответствует утверждённой версии концепта.")
+            run = store.one("SELECT settings_json FROM pipeline_runs WHERE id=?", (detail.get("run_id"),))
+            check_settings = json.loads(run["settings_json"]) if run else store.settings()
+            config = editorial_pipeline.editorial_config(SimpleNamespace(settings=check_settings))
+            body = article.body
+            if not config["minimum_length_chars"] <= len(body) <= config["maximum_length_chars"]:
+                issues.append(f"Объём текста {len(body)} знаков вне согласованного диапазона "
+                              f"{config['minimum_length_chars']}–{config['maximum_length_chars']}.")
+            subscription, final = config["subscription_heading"], config["final_heading"]
+            if body.count(subscription) != 1 or not body[:body.find(subscription)].strip():
+                issues.append("Не найден единственный подписной блок после вступления.")
+            if not body.rstrip().endswith(final):
+                issues.append("Финальный заголовок отсутствует или после него остался текст.")
+            if not writer.content.comments_question or writer.content.comments_question not in body:
+                issues.append("Вопрос для комментариев отсутствует в статье.")
+            for work in dossier.works:
+                heading = re.search(r"(?m)^#{1,6}\s+[^\n]*" + re.escape(work.title) + r"[^\n]*\n", body)
+                if heading:
+                    following = body[heading.end():].lstrip()
+                    if not following.startswith("> Режиссер:") or "> В главных ролях:" not in following.split("\n\n", 1)[0]:
+                        issues.append("После заголовка произведения отсутствует блок режиссёра и актёров: " + work.title)
+            issues.extend(validate_visuals(store, article_id))
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            issues.append("Не удалось проверить контракты/визуальную сборку: " + str(error))
     research = store.one("SELECT * FROM research_jobs WHERE id=?", (detail.get("research_id"),))
     if not research or research["status"] != "sufficient":
         issues.append("Нет достаточного исследования с подтверждёнными источниками.")

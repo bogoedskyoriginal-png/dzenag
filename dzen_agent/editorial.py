@@ -23,8 +23,8 @@ def build_chat_context(store: Store, plan_id: int) -> dict:
     if not plan:
         raise ValueError("Контент-план не найден.")
     concepts = store.rows("SELECT * FROM concepts WHERE plan_id=? ORDER BY scheduled_at,id", (plan_id,))
-    if len(concepts) > 20:
-        raise ValueError("Для груминга выберите план до 20 концептов.")
+    if len(concepts) > 21:
+        raise ValueError("Для груминга выберите план до 21 концепта.")
     analytics = store.one("SELECT payload_json FROM analytics_results WHERE run_id=? AND superseded=0 ORDER BY id DESC LIMIT 1",
                           (plan["run_id"],))
     data = json.loads(analytics["payload_json"]) if analytics else {}
@@ -78,12 +78,17 @@ def build_chat_context(store: Store, plan_id: int) -> dict:
                    "Новая тема или ракурс требуют свежего Research перед Writer.",
                    "Интернет-поиск в чате отключён. Не выдумывай факты и ссылки."]}
     # Protect tokens even against oversized imported/legacy records. Never silently omit concepts.
-    if len(dumps(context)) > 36000:
+    if len(dumps(context)) > 60000:
+        for item in compact_concepts:
+            for key in ("topic", "working_title", "angle", "why_now", "audience_value", "thesis"):
+                item[key] = _text(item.get(key), 220)
+            item["key_points"] = [_text(x, 100) for x in item["key_points"][:3]]
         for item in research:
-            item["key_facts"] = item["key_facts"][:2]
-            item["sources"] = item["sources"][:2]
+            item["summary"] = _text(item["summary"], 200)
+            item["key_facts"] = item["key_facts"][:1]
+            item["sources"] = item["sources"][:1]
         context["history"] = context["history"][:10]
-    if len(dumps(context)) > 36000:
+    if len(dumps(context)) > 60000:
         raise ValueError("План слишком объёмный для компактного чата. Сократите описания концептов.")
     return context
 
@@ -129,7 +134,7 @@ class EditorialChat:
                 + turns
                 + [{"role": "user", "content": text}],
                 "response_format": {"type": "json_object"},
-                "max_tokens": min(int(settings["max_output_tokens"]), 4000)}
+                "max_tokens": min(int(settings["max_output_tokens"]), max(4000, len(context["plan"]) * 500))}
             plan = self.store.one("SELECT * FROM content_plans WHERE id=?", (plan_id,))
             # Snapshot request + revisions before the paid call, so retry replays the same receipt.
             request = {"payload": payload, "model": settings["planner_model"], "run_id": plan["run_id"],
