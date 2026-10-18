@@ -71,12 +71,16 @@ def windows_task_status() -> dict:
         return {"state": "Не удалось проверить Windows Task Scheduler"}
 
 
-def launch_pipeline(run_id: int, *, send=False) -> int:
+def launch_pipeline(run_id: int, *, send=False, analytics_only=False) -> int:
+    if send and analytics_only:
+        raise ValueError("Выберите только Analytics или отправку в Дзен.")
     directory = PROJECT_ROOT / "logs"
     directory.mkdir(exist_ok=True)
     command = [sys.executable, "-m", "dzen_agent.pipeline.run", "--run-id", str(run_id)]
     if send:
         command.append("--send")
+    if analytics_only:
+        command.append("--analytics-only")
     with (directory / f"pipeline-{run_id}.log").open("ab") as log:
         process = subprocess.Popen(command, cwd=PROJECT_ROOT, stdout=log, stderr=log,
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)

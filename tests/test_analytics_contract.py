@@ -122,7 +122,8 @@ def test_same_window_totals_duplicates_and_unpublished_rows(imported):
             {"article_id": "b", "title": "B", "impressions": 900, "opens": 180, "completions": 100,
              "subscriptions": 2, "status": "PUBLISHED"},
             {"article_id": "draft", "title": "Draft", "impressions": 999999, "status": "DRAFT"}]
-    metadata = {"measurement_window": "first_7d", "subscription_attribution_confirmed": True}
+    metadata = {"measurement_window": "first_7d", "subscription_attribution_confirmed": True,
+                "metric_definitions": {"ctr_compatible": True}}
     store.execute("UPDATE statistics_imports SET rows_json=?,metadata_json=? WHERE id=?", (dumps(rows), dumps(metadata), key))
     context = build_analytics_input(store, key)
     assert len(context["articles"]) == 2

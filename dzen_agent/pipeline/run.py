@@ -15,6 +15,7 @@ def main() -> int:
     parser.add_argument("--week", help="Понедельник недели, YYYY-MM-DD")
     parser.add_argument("--scheduled", action="store_true")
     parser.add_argument("--send", action="store_true")
+    parser.add_argument("--analytics-only", action="store_true", help="Остановиться после Analytics, не запускать Discovery")
     args = parser.parse_args()
     config = get_settings()
     store = Store(config.database_path)
@@ -26,7 +27,7 @@ def main() -> int:
         return 0
     run_id = args.run_id or create_run(store, args.week)
     result = Pipeline(store, AITunnel(store, config.aitunnel_api_key)).execute(
-        run_id, allow_dzen=args.send)
+        run_id, allow_dzen=args.send, analytics_only=args.analytics_only)
     print(f"Pipeline {run_id}: {result}")
     return 1 if result in ("NEEDS_ACTION", "STOPPED") else 0
 

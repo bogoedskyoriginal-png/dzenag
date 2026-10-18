@@ -7,6 +7,8 @@ from dzen_agent.config import PROJECT_ROOT, get_settings
 from dzen_agent.store import dumps
 from dzen_agent.store import Store
 from dzen_agent.statistics import import_csv, preview_csv
+from dzen_agent.pipeline.orchestrator import create_run
+from dzen_agent.prompt_service import Prompts
 
 
 def test_all_sections_render_without_key(tmp_path):
@@ -94,3 +96,37 @@ def test_v1_report_period_metadata_and_missing_discovery_prompt(tmp_path, analyt
         assert not app.exception and not app.error
         assert any("ещё не задан" in x.value for x in app.warning)
         assert not store.one("SELECT id FROM prompt_versions WHERE prompt_type='DISCOVERY'")
+
+
+def test_analytics_retry_ui_requires_consent_and_launches_only_one_stage(tmp_path):
+    config = replace(get_settings(), database_path=tmp_path / "ui-retry.db", aitunnel_api_key=None)
+    store = Store(config.database_path)
+    store.initialize()
+    Prompts(store).seed()
+    import_id = import_csv(store, "stats.csv", preview_csv(b"title;views\nA;300"))
+    run_id = create_run(store, "2030-01-07")
+    key = f"run:{run_id}:analytics"
+    store.execute("UPDATE pipeline_runs SET status='NEEDS_ACTION',statistics_id=? WHERE id=?", (import_id, run_id))
+    store.execute("UPDATE pipeline_stages SET status='ERROR' WHERE run_id=? AND stage='ANALYZE'", (run_id,))
+    response = {"choices": [{"finish_reason": "length", "message": {"content": '{"old":'}}],
+                "usage": {"cost_rub": 1.19}}
+    store.execute("INSERT INTO ai_calls(call_key,status,result_json,created_at,updated_at) VALUES(?,'SUCCEEDED',?,'2030','2030')",
+                  (key, dumps(response)))
+    with patch("dzen_agent.config.get_settings", return_value=config), patch("dzen_agent.scheduler.launch_pipeline") as launch:
+        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui.py"), default_timeout=20).run()
+        app.sidebar.radio[0].set_value("Статистика").run()
+        assert not app.exception and not app.error
+        assert any("публикаций обработано: 1" in x.value for x in app.markdown)
+        app.sidebar.radio[0].set_value("Автопилот").run()
+        assert not app.exception and not app.error
+        assert any("обрезан по лимиту токенов" in x.value for x in app.warning)
+        next(x for x in app.button if x.label == "Повторить только Analytics (платно)").click().run()
+        launch.assert_not_called()
+        assert not app.exception
+        assert any("Подтвердите новый платный запрос" in x.value for x in app.error)
+        assert store.one("SELECT call_key FROM ai_calls")["call_key"] == key
+        next(x for x in app.checkbox if x.label == "Я проверил историю AITUNNEL и разрешаю оплату нового запроса").check().run()
+        next(x for x in app.button if x.label == "Повторить только Analytics (платно)").click().run()
+        launch.assert_called_once_with(run_id, analytics_only=True)
+        assert not app.exception and not app.error
+        assert ":archived:" in store.one("SELECT call_key FROM ai_calls")["call_key"]

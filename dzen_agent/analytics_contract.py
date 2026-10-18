@@ -213,12 +213,16 @@ class Analytics(Contract):
     def validate_input(self, context: dict) -> None:
         articles = context["articles"]
         ids = {a["article_id"] for a in articles}
-        if self.data_quality.articles_total != len(ids):
-            raise ValueError("Analytics изменил количество публикаций входной выборки.")
+        expected_count = context["analysis_config"].get("population_article_count", len(ids))
+        if self.data_quality.articles_total != expected_count:
+            raise ValueError("Analytics изменил количество публикаций полной статистической сводки.")
         if any(not set(o.article_ids).issubset(ids) for o in self.observations):
             raise ValueError("Analytics ссылается на публикацию, которой нет во входных данных.")
         if not context["analysis_config"]["comparison_available"] and self.channel_diagnosis.trend != "unknown":
             raise ValueError("Нельзя определять тренд без сопоставимого предыдущего периода.")
+        if context.get("metric_definitions", {}).get("ctr_compatible") is False and any(
+                o.metric.lower() == "ctr" and o.value is not None for o in self.observations):
+            raise ValueError("CTR нельзя утверждать до подтверждения определений показов и открытий.")
         expected_period = context["run_context"]["period"]
         if self.period.timezone != expected_period["timezone"] or any(
                 timestamp(getattr(self.period, key), self.period.timezone) != timestamp(expected_period[key], self.period.timezone)

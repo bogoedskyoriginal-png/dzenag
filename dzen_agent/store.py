@@ -27,7 +27,7 @@ DEFAULTS = {
     "channel_topic": "", "ai_qa_enabled": False, "max_output_tokens": 8000,
     "statistics_max_age_days": 14, "research_use_web_tool": False,
     "analytics_model": "", "research_model": "", "planner_model": "",
-    "discovery_model": "",
+    "discovery_model": "", "analytics_reasoning_effort": "low", "analytics_max_output_tokens": 32000,
     "visual_model": "",
     "writer_model": "", "image_model": "", "dzen_statistics_url": "",
     "image_quality": "low", "dzen_adapter_verified": False,
@@ -57,7 +57,7 @@ class Store(ArticleRepository):
 
     def set_setting(self, key: str, value: Any) -> None:
         if any(word in key.lower() for word in ("api_key", "password", "secret", "token")):
-            if key != "max_output_tokens":
+            if key not in ("max_output_tokens", "analytics_max_output_tokens"):
                 raise ValueError("Секреты хранятся только в .env.")
         self.execute(
             "INSERT INTO app_settings(key,value) VALUES(?,?) "

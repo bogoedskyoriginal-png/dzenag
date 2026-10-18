@@ -181,6 +181,8 @@ class AITunnel:
                                   "citations": data.get("citations", []),
                                   "search_results": data.get("search_results", []),
                                   "model": data.get("model", model)}
+                        if operation == "ANALYTICS":
+                            result["analytics_request"] = {"model": model, **payload}
                     with self.store._connect() as conn:
                         self._usage(conn, call_key, operation, data.get("model", model), run_id,
                                     article_id, usage, True, None, request_id)

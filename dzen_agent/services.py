@@ -145,11 +145,17 @@ class ContentService:
                  + dumps(schema.model_json_schema())},
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": int(self.settings["max_output_tokens"]),
+            "max_tokens": int(self.settings.get("analytics_max_output_tokens", 32000)
+                              if kind == "ANALYTICS" else self.settings["max_output_tokens"]),
         }
         model_limit = self.settings.get("public_catalog", {}).get("chat", {}).get(model, {}).get("max_output")
         if isinstance(model_limit, int) and model_limit > 0:
             payload["max_tokens"] = min(payload["max_tokens"], model_limit)
+        if kind == "ANALYTICS" and model.rsplit("/", 1)[-1] == "deepseek-v4-flash-0731":
+            effort = self.settings.get("analytics_reasoning_effort", "low")
+            if effort not in ("low", "medium", "high"):
+                raise UserActionRequired("Для Analytics выберите reasoning low, medium или high.")
+            payload["reasoning"] = {"effort": effort}
         if native_contract:
             payload["messages"][1]["content"] = dumps(context)
         if image_inputs:
@@ -161,13 +167,20 @@ class ContentService:
             call_key=call_key, operation=operation or {"WRITER": "WRITE", "PLANNER": "PLANNING"}
             .get(kind, kind), model=model, payload=payload, run_id=self.run_id, article_id=article_id,
         )
+        from dzen_agent.ai_response import require_complete_response
+        require_complete_response(response)
         try:
             content = response["choices"][0]["message"]["content"]
             result = schema.model_validate_json(content)
         except (KeyError, IndexError, TypeError, ValidationError) as error:
+            details = ""
+            if isinstance(error, ValidationError):
+                details = " Ошибки: " + "; ".join(
+                    f"{'.'.join(map(str, e['loc'])) or 'JSON'}: {e['type']} ({e['msg']})"
+                    for e in error.errors(include_input=False, include_url=False)[:8])
             raise UserActionRequired(
                 "Модель вернула ответ, не соответствующий структуре. Оплаченный ответ сохранён; "
-                "автоматически повторно оплачивать его не будем. Проверьте модель и промпт."
+                "автоматически повторно оплачивать его не будем." + details
             ) from error
         return result, response
 

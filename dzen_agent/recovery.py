@@ -8,13 +8,26 @@ from dzen_agent.prompt_service import Prompts
 from dzen_agent.store import dumps, now_iso
 
 
-def authorize_retry(store, call_key: str, *, confirmed: bool) -> None:
+def authorize_retry(store, call_key: str, *, confirmed: bool, analytics_run_id: int | None = None) -> None:
     if not confirmed:
         raise UserActionRequired("Подтвердите новый платный запрос после проверки истории AITUNNEL.")
     with exclusive_lock(store.database_path.parent / "pipeline.lock"), exclusive_lock(
             store.database_path.parent / "ai.lock"):
         archive = call_key + ":archived:" + uuid4().hex
         with store._connect() as conn:
+            if analytics_run_id is not None:
+                import json
+                run = conn.execute("SELECT settings_json FROM pipeline_runs WHERE id=?", (analytics_run_id,)).fetchone()
+                stage = conn.execute("SELECT status FROM pipeline_stages WHERE run_id=? AND stage='ANALYZE'",
+                                     (analytics_run_id,)).fetchone()
+                revision = json.loads(run["settings_json"]).get("analysis_revision", 0) if run else 0
+                expected = f"run:{analytics_run_id}" + (f":analysis-v{revision}" if revision else "") + ":analytics"
+                downstream = conn.execute("SELECT 1 FROM pipeline_stages WHERE run_id=? AND stage NOT IN "
+                    "('COLLECT_STATS','ANALYZE') AND status<>'PENDING'", (analytics_run_id,)).fetchone()
+                result = conn.execute("SELECT 1 FROM analytics_results WHERE run_id=? AND superseded=0",
+                                      (analytics_run_id,)).fetchone()
+                if not run or not stage or stage["status"] != "ERROR" or expected != call_key or downstream or result:
+                    raise ValueError("Повтор только Analytics доступен для неудавшегося ANALYZE до следующих этапов.")
             row = conn.execute("SELECT * FROM ai_calls WHERE call_key=?", (call_key,)).fetchone()
             if not row or ":archived:" in call_key:
                 raise ValueError("Запрос не найден или уже перенесён в историю.")
@@ -34,7 +47,8 @@ def refresh_pending_config(store, run_id: int) -> None:
         old = json.loads(run["settings_json"])
         current = store.settings()
         keys = ["analytics_model", "discovery_model", "research_model", "planner_model", "writer_model", "image_model", "visual_model",
-                "research_use_web_tool", "max_output_tokens", "image_quality", "max_retries"]
+                "research_use_web_tool", "max_output_tokens", "analytics_max_output_tokens",
+                "analytics_reasoning_effort", "image_quality", "max_retries"]
         old.update({key: current[key] for key in keys})
         store.execute("UPDATE pipeline_runs SET settings_json=?,prompts_json=? WHERE id=?",
                       (dumps(old), dumps(Prompts(store).snapshot()), run_id))

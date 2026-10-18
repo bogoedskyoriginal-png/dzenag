@@ -94,6 +94,7 @@ def test_excel_and_csv_pass_the_same_normalized_data_to_analytics(tmp_path):
     for import_id in (excel_id, csv_id):
         metadata = json.loads(store.one("SELECT metadata_json FROM statistics_imports WHERE id=?", (import_id,))["metadata_json"])
         metadata["measurement_window"] = "first_7d"
+        metadata["metric_definitions"] = {"ctr_compatible": True}
         store.execute("UPDATE statistics_imports SET metadata_json=? WHERE id=?", (dumps(metadata), import_id))
     from_excel = build_analytics_input(store, excel_id)
     from_csv = build_analytics_input(store, csv_id)

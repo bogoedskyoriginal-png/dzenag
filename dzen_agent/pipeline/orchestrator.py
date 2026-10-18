@@ -79,11 +79,13 @@ class Pipeline:
         if self.store.settings()["stop_requested"]:
             raise UserActionRequired("Остановлено пользователем. Готовые результаты сохранены.")
 
-    def execute(self, run_id: int, *, allow_dzen=False) -> str:
+    def execute(self, run_id: int, *, allow_dzen=False, analytics_only=False) -> str:
+        if allow_dzen and analytics_only:
+            raise ValueError("Режим только Analytics несовместим с отправкой в Дзен.")
         with exclusive_lock(self.store.database_path.parent / "pipeline.lock"):
-            return self._execute(run_id, allow_dzen=allow_dzen)
+            return self._execute(run_id, allow_dzen=allow_dzen, analytics_only=analytics_only)
 
-    def _execute(self, run_id: int, *, allow_dzen=False) -> str:
+    def _execute(self, run_id: int, *, allow_dzen=False, analytics_only=False) -> str:
         run = self.store.one("SELECT * FROM pipeline_runs WHERE id=?", (run_id,))
         if not run:
             raise ValueError("Запуск не найден.")
@@ -96,9 +98,13 @@ class Pipeline:
                            "ended_at=NULL,error=NULL WHERE id=?", (now_iso(), run_id))
         stage = "COLLECT_STATS"
         try:
-            if settings.get("pipeline_flow") == "analytics_v1":
+            if settings.get("pipeline_flow") == "analytics_v1" and not analytics_only:
                 editorial_pipeline.preflight(settings, json.loads(run["prompts_json"]))
             for stage in stages_for(settings):
+                if analytics_only and stage not in ("COLLECT_STATS", "ANALYZE"):
+                    self.store.execute("UPDATE pipeline_runs SET status='ANALYTICS_READY',error=NULL,ended_at=? WHERE id=?",
+                                       (now_iso(), run_id))
+                    return "ANALYTICS_READY"
                 self._check_stop()
                 record = self.store.one("SELECT * FROM pipeline_stages WHERE run_id=? AND stage=?",
                                         (run_id, stage))

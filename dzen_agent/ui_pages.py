@@ -16,7 +16,7 @@ from dzen_agent.browser.statistics_download import STATUS as CSV_DOWNLOAD_STATUS
 from dzen_agent.errors import UserActionRequired, log_exception, redact
 from dzen_agent.pipeline.orchestrator import approve_week, create_run, estimate_operations, stages_for
 from dzen_agent.analytics_contract import analytics_summary, briefs, parse_analytics
-from dzen_agent.analytics_input import validate_metadata
+from dzen_agent.analytics_input import prepare_analytics_input, validate_metadata
 from dzen_agent.plan_review import approve_plan, editing_reason, is_approved
 from dzen_agent.prompt_service import PROMPT_TYPES, VARIABLES, Prompts
 from dzen_agent.provider import AITunnel, choose_defaults, fetch_catalog
@@ -217,6 +217,22 @@ def statistics_page(store, config):
                        "Лист": json.loads(r["metadata_json"]).get("source", {}).get("sheet_name", "")}
                       for r in imports], hide_index=True, use_container_width=True)
         selected = st.selectbox("Импорт для анализа", [r["id"] for r in imports])
+        with st.expander("Проверка данных для Analytics — без AI"):
+            context, audit = prepare_analytics_input(store, selected)
+            quality = audit["data_quality"]
+            st.write(f"Строк в импорте: {quality['source_rows']}; сводных строк исключено: {quality['aggregate_rows']}; "
+                     f"публикаций обработано: {quality['unique_articles']}; примеров для AI: {len(context['articles'])}.")
+            st.caption(f"Контекст: {len(dumps(context)):,} символов. Это не подсчёт токенов модели. "
+                       "Сводка рассчитана по всем публикациям. Исходный импорт сохранён без изменений.")
+            st.json(context["metric_definitions"])
+            st.json(quality)
+            st.dataframe([{"Показатель": k, **v} for k, v in context["channel_metrics"]["metric_statistics"].items()],
+                         hide_index=True, use_container_width=True)
+            if audit["rankings"]:
+                metric = st.selectbox("Полный рейтинг публикаций по показателю", list(audit["rankings"]))
+                st.dataframe(audit["rankings"][metric], hide_index=True, use_container_width=True)
+            st.caption("Превышение открытий над показами требует уточнения определений и источников трафика; "
+                       "это не автоматическая ошибка. Дата анализа не заменяет неизвестный период или as_of.")
         if st.button("Проанализировать статистику", disabled=not config.aitunnel_api_key):
             action("Анализирую…", lambda: service(store, config).analyze(selected, "analytics:" + uuid4().hex))
     for row in store.rows("SELECT * FROM analytics_results ORDER BY id DESC LIMIT 10"):
@@ -236,10 +252,14 @@ def statistics_page(store, config):
             end = st.date_input("Конец периода, если известно", value=datetime.fromisoformat(period["end"]).date() if period.get("end") else None)
             as_of = st.date_input("Дата формирования выгрузки, если известна", value=datetime.fromisoformat(period["as_of"]).date() if period.get("as_of") else None)
             attribution = st.checkbox("Подписки в выгрузке достоверно относятся к отдельным статьям", value=metadata.get("subscription_attribution_confirmed", False))
+            ctr_confirmed = st.checkbox("Подтверждаю: открытия и показы имеют общий охват и позволяют считать CTR",
+                value=metadata.get("metric_definitions", {}).get("ctr_compatible", False),
+                help="Не отмечайте только на основании названий колонок. Сначала проверьте определения счётчиков Дзена.")
             if st.button("Сохранить сведения о периоде"):
                 def save_metadata():
                     value = validate_metadata({**metadata, "measurement_window": window,
                         "subscription_attribution_confirmed": attribution,
+                        "metric_definitions": {**metadata.get("metric_definitions", {}), "ctr_compatible": ctr_confirmed},
                         "period": {"start": start.isoformat() if start else None, "end": end.isoformat() if end else None,
                                    "as_of": as_of.isoformat() if as_of else None, "timezone": "Europe/Moscow"}})
                     store.execute("UPDATE statistics_imports SET metadata_json=? WHERE id=?", (dumps(value), selected))
@@ -568,6 +588,12 @@ def models_page(store, config):
                    ("max_output_tokens", "Лимит выходных токенов", 1000, 128000)]
         for key, label, low, high in numeric:
             values[key] = st.number_input(label, low, high, int(settings[key]))
+        values["analytics_max_output_tokens"] = st.number_input("Лимит выходных токенов только Analytics", 1000, 128000,
+            int(settings["analytics_max_output_tokens"]), help="Включает reasoning; ограничивается возможностями выбранной модели.")
+        efforts = ["low", "medium", "high"]
+        values["analytics_reasoning_effort"] = st.selectbox("Reasoning Analytics для DeepSeek V4 Flash 0731", efforts,
+            index=efforts.index(settings["analytics_reasoning_effort"]),
+            help="low уменьшает усилие рассуждений; точное число reasoning tokens не гарантируется.")
         for key, label in [("monthly_soft_budget_rub", "Локальный бюджет за 30 дней, ₽"),
                            ("stop_when_balance_below_rub", "Остановиться при балансе ниже, ₽")]:
             values[key] = st.number_input(label, min_value=0.0, value=float(settings[key]), step=10.0)
@@ -647,6 +673,8 @@ def autopilot_page(store, config):
         run_id = st.selectbox("Запуск", [r["id"] for r in runs])
         run = next(r for r in runs if r["id"] == run_id)
         show_run(store, run)
+        if run["status"] == "ANALYTICS_READY":
+            st.success("Analytics готов. Следующие этапы не запускались. «Продолжить подготовку» запустит Discovery и дальнейшие платные этапы.")
         if st.button("Продолжить подготовку", disabled=settings["stop_requested"]):
             action("Продолжаю с сохранённого этапа…", lambda: scheduler.launch_pipeline(run_id))
         if st.button("Утвердить неделю", key="autopilot-approve"):
@@ -671,8 +699,23 @@ def autopilot_page(store, config):
                 if receipt["error"]:
                     st.warning(receipt["error"])
                 if receipt["result_json"]:
-                    st.json(json.loads(receipt["result_json"]))
+                    saved_response = json.loads(receipt["result_json"])
+                    from dzen_agent.ai_response import require_complete_response
+                    try:
+                        require_complete_response(saved_response)
+                    except UserActionRequired as error:
+                        st.warning(str(error))
+                    st.json(saved_response)
                 retry_confirmed = st.checkbox("Я проверил историю AITUNNEL и разрешаю оплату нового запроса")
+                failed_analytics = store.one("SELECT status FROM pipeline_stages WHERE run_id=? AND stage='ANALYZE'", (run_id,))
+                if call_key.endswith(":analytics") and failed_analytics and failed_analytics["status"] == "ERROR":
+                    st.caption("Повтор только Analytics использует тот же импорт и сохранённые промпты запуска. "
+                               "После успеха остановится перед Discovery. Старый оплаченный ответ останется в истории.")
+                    if st.button("Повторить только Analytics (платно)", disabled=settings["stop_requested"]):
+                        def retry_analytics_only():
+                            authorize_retry(store, call_key, confirmed=retry_confirmed, analytics_run_id=run_id)
+                            return scheduler.launch_pipeline(run_id, analytics_only=True)
+                        action("Запускаю только Analytics…", retry_analytics_only)
                 if st.button("Разрешить повтор выбранного запроса"):
                     action("Сохраняю разрешение…", lambda: authorize_retry(store, call_key, confirmed=retry_confirmed))
                     st.info("Теперь нажмите «Продолжить подготовку». Уже готовые статьи не переписываются.")
