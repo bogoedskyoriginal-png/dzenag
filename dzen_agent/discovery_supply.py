@@ -26,6 +26,13 @@ def supply_status(store, run_id):
     requests = store.rows("SELECT * FROM discovery_requests WHERE run_id=? AND analysis_revision=? ORDER BY created_at,call_key", (run_id, revision))
     committed = sum(r["cost_rub"] if r["cost_rub"] is not None else r["reserved_rub"] for r in requests)
     grant = store.one("SELECT * FROM discovery_topups WHERE run_id=? AND analysis_revision=?", (run_id, revision))
+    if not grant:
+        from dzen_agent.execution import authorization
+        policy = authorization(store, run_id)
+        if policy:
+            grant = {"budget_rub": policy["budget_rub"], "reserve_rub": 0,
+                     "max_calls": policy["max_repairs"] + 1, "authorized_at": policy["authorized_at"],
+                     "run_budget_managed": True}
     return {"ready": ready, "target": settings["max_articles_per_week"],
             "missing": max(0, settings["max_articles_per_week"] - ready), "grant": grant,
             "requests": requests, "committed_rub": committed, "revision": revision, "result": result}
@@ -83,7 +90,7 @@ def fill_discovery(service, analytics, base_key):
         else:
             if any(r["cost_rub"] is None for r in status["requests"]):
                 raise UserActionRequired("Стоимость предыдущего дозаполнения неизвестна. Новые расходы заблокированы.")
-            if any(r["cost_rub"] > r["reserved_rub"] and r["created_at"] >= grant["authorized_at"] for r in status["requests"]):
+            if not grant.get("run_budget_managed") and any(r["cost_rub"] > r["reserved_rub"] and r["created_at"] >= grant["authorized_at"] for r in status["requests"]):
                 raise UserActionRequired("Превышен резерв предыдущего поиска. Для новых расходов нужно отдельное разрешение.")
             if (len(status["requests"]) >= grant["max_calls"] or
                     status["committed_rub"] + grant["reserve_rub"] > grant["budget_rub"] + 1e-9):
@@ -97,7 +104,8 @@ def fill_discovery(service, analytics, base_key):
                           (key, run_id, status["revision"], grant["reserve_rub"], dumps(additional), now_iso(), now_iso()))
             request = store.one("SELECT * FROM discovery_requests WHERE call_key=?", (key,))
         try:
-            service.discover(analytics, request["call_key"], additional=json.loads(request["context_json"]))
+            from dzen_agent.execution import perform
+            perform(service, lambda: service.discover(analytics, request["call_key"], additional=json.loads(request["context_json"])))
             store.execute("UPDATE discovery_requests SET status='DONE',error=NULL,updated_at=? WHERE call_key=?", (now_iso(), request["call_key"]))
         except Exception as error:
             processed = store.one("SELECT id FROM discovery_batches WHERE call_key=?", (request["call_key"],))
@@ -110,12 +118,12 @@ def fill_discovery(service, analytics, base_key):
                 raise
         finally:
             usage = store.one("SELECT SUM(cost_rub) AS cost,COUNT(*) AS n,SUM(cost_rub IS NULL) AS unknown "
-                              "FROM usage_events WHERE call_key=?", (request["call_key"],))
+                              "FROM usage_events WHERE call_key=? OR call_key LIKE ?", (request["call_key"], request["call_key"] + ":repair:%"))
             cost = usage["cost"] if usage["n"] and not usage["unknown"] else None
             store.execute("UPDATE discovery_requests SET cost_rub=?,updated_at=? WHERE call_key=?", (cost, now_iso(), request["call_key"]))
         updated = supply_status(store, run_id)
         actual = store.one("SELECT cost_rub FROM discovery_requests WHERE call_key=?", (request["call_key"],))["cost_rub"]
-        if updated["missing"] and actual is not None and (actual > request["reserved_rub"] or updated["committed_rub"] > grant["budget_rub"]):
+        if not grant.get("run_budget_managed") and updated["missing"] and actual is not None and (actual > request["reserved_rub"] or updated["committed_rub"] > grant["budget_rub"]):
             raise UserActionRequired("Фактическая стоимость превысила локальный резерв. Дополнительные поиски остановлены; проверьте расходы.")
 
 

@@ -56,10 +56,12 @@ def create_run(store: Store, week: str | None = None, *, settings_override: dict
     settings = store.settings()
     if settings_override:
         allowed = {"max_articles_per_week", "publication_days", "publication_time", "publication_times",
-                   "publication_slots", "max_articles_per_day"}
+                   "publication_slots", "max_articles_per_day", "generation_calendar", "editorial_wishes"}
         if set(settings_override) - allowed:
             raise ValueError("Мастер недели может изменять только число статей и расписание.")
         settings.update(settings_override)
+    if settings.get("generation_calendar"):
+        settings["max_output_tokens"] = max(settings["max_output_tokens"], settings["max_articles_per_week"] * 2000)
     settings.setdefault("pipeline_flow", "analytics_v1")
     slots = week_slots(week, settings)
     if any(datetime.fromisoformat(slot) <= datetime.now(MSK) for slot in slots):
@@ -103,19 +105,31 @@ class Pipeline:
         run = self.store.one("SELECT * FROM pipeline_runs WHERE id=?", (run_id,))
         if not run:
             raise ValueError("Запуск не найден.")
-        if run["status"] == "SUCCEEDED":
-            return "SUCCEEDED"
+        if run["status"] in ("SUCCEEDED", "PREPARED"):
+            if run["status"] == "PREPARED":
+                from dzen_agent.autonomy import deliver_drafts
+                deliver_drafts(self, run_id)
+            return run["status"]
+        # Holding the OS lock proves any old RUNNING rows belong to an interrupted worker.
+        self.store.execute("UPDATE pipeline_items SET status='ERROR',error='Предыдущий процесс прерван; сохранённые квитанции будут использованы повторно' WHERE run_id=? AND status='RUNNING'", (run_id,))
+        self.store.execute("UPDATE pipeline_stages SET status='PENDING' WHERE run_id=? AND status='RUNNING'", (run_id,))
         settings = json.loads(run["settings_json"])
         service = self.service_factory(self.store, self.provider, settings=settings,
                                        prompts=json.loads(run["prompts_json"]), run_id=run_id)
+        settings = service.settings
+        self._service = service
         self.store.execute("UPDATE pipeline_runs SET status='RUNNING',started_at=COALESCE(started_at,?),"
                            "ended_at=NULL,error=NULL WHERE id=?", (now_iso(), run_id))
         stage = "COLLECT_STATS"
         self._seen_research = set()
         partial_errors = []
         try:
+            from dzen_agent.execution import authorization
+            if authorization(self.store, run_id) and any(not editorial_pipeline.native(service.prompts.get(kind.upper()), kind)
+                    for kind in ("discovery", "planner", "research", "writer", "image")):
+                raise UserActionRequired("Для автономной подготовки выберите явный контракт 1.0 у Discovery, Planner, Research, Writer и Image в настройках промптов. Прежний ручной режим сохранён; запросы ещё не оплачивались.")
             if settings.get("pipeline_flow") == "analytics_v1" and not analytics_only:
-                editorial_pipeline.preflight(settings, json.loads(run["prompts_json"]))
+                editorial_pipeline.preflight(settings, service.prompts)
             for stage in stages_for(settings):
                 if stage == "REVIEW" and partial_errors:
                     raise UserActionRequired("Не все материалы готовы. " + "; ".join(partial_errors))
@@ -130,12 +144,21 @@ class Pipeline:
                     plan = self.store.one("SELECT * FROM content_plans WHERE run_id=?", (run_id,))
                     if not plan:
                         raise UserActionRequired("Контент-план ещё не сохранён. Завершите этап PLAN.")
-                    native_research = editorial_pipeline.native(json.loads(run["prompts_json"]).get("RESEARCH"), "research")
+                    native_research = editorial_pipeline.native(service.prompts.get("RESEARCH"), "research")
+                    from dzen_agent.execution import authorization
+                    if authorization(self.store, run_id) and not is_approved(plan):
+                        from dzen_agent.autonomy import approve_automatically
+                        approve_automatically(self.store, run_id)
+                        plan = self.store.one("SELECT * FROM content_plans WHERE run_id=?", (run_id,))
                     if (native_research or self.store.settings()["mode"] != "AUTOPILOT") and not is_approved(plan):
                         return self._wait(run_id, stage, "AWAITING_PLAN_REVIEW",
                                           "Контент-план готов. Проверьте идеи перед созданием статей.")
                 if record["status"] == "SUCCEEDED":
                     continue
+                from dzen_agent.execution import authorization
+                if stage in ("RESEARCH", "REFRESH_RESEARCH", "WRITE", "IMAGE", "QA") and authorization(self.store, run_id):
+                    from dzen_agent.autonomy import produce_articles
+                    return produce_articles(self, run, service)
                 self.store.execute("UPDATE pipeline_stages SET status='RUNNING',started_at=?,"
                                    "ended_at=NULL,error=NULL,attempts=attempts+1 WHERE id=?",
                                    (now_iso(), record["id"]))
@@ -175,7 +198,8 @@ class Pipeline:
                 else:
                     self._item_errors = []
                     try:
-                        self._stage(stage, run, service)
+                        from dzen_agent.execution import perform
+                        perform(service, lambda: self._stage(stage, run, service))
                         if self._item_errors:
                             raise PartialStage("; ".join(self._item_errors))
                     except PartialStage as error:
@@ -192,12 +216,15 @@ class Pipeline:
             path = log_exception(error, f"pipeline={run_id}; stage={stage}")
             message = redact(str(error)) if isinstance(error, (UserActionRequired, ValueError)) else (
                 "Ошибка выполнения. Подробности сохранены в журнале.")
-            self.store.log(stage, message, {"run_id": run_id, "log": str(path)})
+            from dzen_agent.execution import category
+            self.store.log(stage, message, {"run_id": run_id, "log": str(path), "category": category(error)})
             status = "STOPPED" if self.store.settings()["stop_requested"] else "NEEDS_ACTION"
             self.store.execute("UPDATE pipeline_stages SET status='ERROR',ended_at=?,error=? "
                                "WHERE run_id=? AND stage=? AND status<>'SUCCEEDED'", (now_iso(), message, run_id, stage))
             self.store.execute("UPDATE pipeline_runs SET status=?,ended_at=?,error=? WHERE id=?",
                                (status, now_iso(), message, run_id))
+            self.store.execute("UPDATE pipeline_stages SET status='ERROR',ended_at=?,error=? WHERE run_id=? AND status='RUNNING'", (now_iso(), message, run_id))
+            self.store.execute("UPDATE pipeline_items SET status='ERROR',error=?,updated_at=? WHERE run_id=? AND status='RUNNING'", (message, now_iso(), run_id))
             return status
 
     def _wait(self, run_id, stage, status, message):
@@ -232,7 +259,8 @@ class Pipeline:
                            "DO UPDATE SET status='RUNNING',attempts=attempts+1,error=NULL,updated_at=excluded.updated_at",
                            (run_id, concept["id"], stage, fingerprint, article_id, now_iso()))
         try:
-            value = operation()
+            from dzen_agent.execution import perform
+            value = perform(self._service, operation) if hasattr(self, "_service") else operation()
             status, message = "SUCCEEDED", None
         except Exception as error:
             self._check_stop()
@@ -253,6 +281,12 @@ class Pipeline:
         if settings.get("analysis_revision", 0):
             key += f":analysis-v{settings['analysis_revision']}"
         if stage == "COLLECT_STATS":
+            from dzen_agent.execution import authorization
+            if authorization(self.store, run_id) and self.dzen and self.store.settings().get("statistics_auto_export"):
+                try:
+                    self.dzen.collect_statistics()
+                except Exception as error:
+                    self.store.log("STATISTICS_EXPORT", "Экспорт недоступен; проверяем последний локальный импорт", {"run_id": run_id, "reason":str(error)})
             latest = self.store.one("SELECT * FROM statistics_imports ORDER BY id DESC LIMIT 1")
             if not latest:
                 raise UserActionRequired("Загрузите CSV в разделе «Статистика».")
@@ -300,7 +334,19 @@ class Pipeline:
                 from dzen_agent.editorial_contracts import DiscoveryV1
                 if json.loads(discovery["payload_json"]).get("stage") == "discovery":
                     DiscoveryV1.model_validate_json(discovery["payload_json"])
-                    payload = fill_discovery(service, analytics, key + ":discovery")
+                    try:
+                        payload = fill_discovery(service, analytics, key + ":discovery")
+                    except UserActionRequired:
+                        from dzen_agent.execution import authorization
+                        from dzen_agent.discovery_supply import supply_status
+                        supply = supply_status(self.store, run_id)
+                        if not authorization(self.store, run_id) or not supply["ready"]:
+                            raise
+                        settings["requested_count"] = settings.get("requested_count", settings["max_articles_per_week"])
+                        settings["max_articles_per_week"] = supply["ready"]
+                        self.store.execute("UPDATE pipeline_runs SET settings_json=? WHERE id=?", (dumps(settings), run_id))
+                        self.store.log("PARTIAL_PLAN", "Подтверждённые идеи переданы в частичный план без неподтверждённых тем", {"run_id": run_id, "count": supply["ready"], "requested": settings["requested_count"]})
+                        payload = supply["result"].model_dump(mode="json")
                 else:
                     payload = json.loads(discovery["payload_json"])
                 service.plan_from_discovery(analytics, payload, run["week_start"], key + ":plan")

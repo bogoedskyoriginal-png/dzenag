@@ -188,7 +188,7 @@ def test_excel_sheet_selection_mapping_and_import_in_streamlit(tmp_path):
     upload = SimpleNamespace(name="original.xlsx", getvalue=lambda: raw)
     with patch("dzen_agent.config.get_settings", return_value=config), patch("streamlit.file_uploader", return_value=upload):
         app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent/ui.py"), default_timeout=20).run()
-        app.sidebar.radio[0].set_value("Аналитика").run()
+        app.sidebar.radio[0].set_value("Настройки").run()
         next(x for x in app.selectbox if x.label == "Лист Excel").set_value("Материалы").run()
         assert not app.exception and not app.error
         next(x for x in app.selectbox if x.label == "Мой заголовок").set_value("title")

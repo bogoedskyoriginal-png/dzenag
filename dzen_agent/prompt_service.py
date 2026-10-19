@@ -64,13 +64,27 @@ class Prompts:
             self.save(kind, title, content, only_if_empty=True)
 
     def active(self, kind: str) -> dict | None:
-        return self.store.one("SELECT * FROM prompt_versions WHERE prompt_type=? AND is_active=1",
-                              (kind,))
+        row = self.store.one("SELECT * FROM prompt_versions WHERE prompt_type=? AND is_active=1", (kind,))
+        return self.enrich({kind: row})[kind] if row else None
 
-    def save(self, kind: str, title: str, content: str, *, only_if_empty=False) -> int:
+    def enrich(self, prompts):
+        result = {}
+        for kind, prompt in prompts.items():
+            if prompt:
+                meta = self.store.one("SELECT * FROM prompt_contracts WHERE prompt_id=?", (prompt["id"],))
+                prompt = {**prompt, "contract_stage": meta["stage"] if meta else kind.lower(),
+                          "contract_version": meta["version"] if meta else prompt.get("contract_version", "legacy")}
+            result[kind] = prompt
+        return result
+
+    def save(self, kind: str, title: str, content: str, *, only_if_empty=False, contract_version=None) -> int:
         if kind not in PROMPT_TYPES or not content.strip() or not title.strip():
             raise ValueError("Укажите тип, название и непустой текст промпта.")
         template_variables(content)
+        previous = self.active(kind)
+        contract_version = contract_version or (previous or {}).get("contract_version", "legacy")
+        if contract_version not in ("legacy", "1.0"):
+            raise ValueError("Неизвестная версия технического контракта.")
         with self.store._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             version = conn.execute("SELECT COALESCE(MAX(version),0) FROM prompt_versions "
@@ -82,13 +96,15 @@ class Prompts:
                 "INSERT INTO prompt_versions(prompt_type,title,content,version,created_at,is_active) "
                 "VALUES(?,?,?,?,?,1)", (kind, title, content, version + 1, now_iso()),
             )
+            conn.execute("INSERT INTO prompt_contracts VALUES(?,?,?)", (cursor.lastrowid, kind.lower(), contract_version))
             return cursor.lastrowid
 
     def restore(self, version_id: int) -> int:
         old = self.store.one("SELECT * FROM prompt_versions WHERE id=?", (version_id,))
         if not old:
             raise ValueError("Версия промпта не найдена.")
-        return self.save(old["prompt_type"], old["title"], old["content"])
+        meta = self.enrich({old["prompt_type"]: old})[old["prompt_type"]]
+        return self.save(old["prompt_type"], old["title"], old["content"], contract_version=meta["contract_version"])
 
     def snapshot(self) -> dict:
         return {kind: self.active(kind) for kind in PROMPT_TYPES}

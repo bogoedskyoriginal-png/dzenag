@@ -13,6 +13,7 @@ def download_statistics(page, destination, *, statistics_url=None, verified_sele
         raise UserActionRequired(STATUS)
     page.goto(validate_dzen_url(statistics_url), wait_until="domcontentloaded")
     button = page.locator(verified_selector)
+    button.first.wait_for(state="visible", timeout=30000)
     if button.count() != 1 or not button.is_visible():
         raise UserActionRequired("Кнопка экспорта не определена однозначно. Загрузите CSV вручную.")
     with page.expect_download(timeout=30000) as download_info:

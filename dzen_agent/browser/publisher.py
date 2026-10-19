@@ -7,6 +7,8 @@ import re
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs
+from uuid import uuid4
 
 from playwright.sync_api import expect, sync_playwright
 
@@ -77,6 +79,14 @@ class DzenPublisher:
         self.studio(page)
         tab = "Ожидают публикации" if state == "pending" else "Черновики"
         page.get_by_text(re.compile("^" + tab + r"\d*$")).click()
+        row = page.get_by_role("row", name="Публикация", exact=True).filter(
+            has=page.get_by_role("heading", name=title, exact=True))
+        try:
+            expect(row).to_have_count(1, timeout=5000)
+            return row
+        except AssertionError:
+            if row.count() > 1:
+                raise UserActionRequired("В Студии несколько материалов с этим заголовком. Выберите нужный вручную.") from None
         page.get_by_placeholder("Поиск публикации").fill(title)
         with page.expect_response(lambda response: urlsplit(response.url).path == "/editor-api/v3/publications"
                                   and response.request.method == "GET", timeout=30000) as completed:
@@ -95,11 +105,15 @@ class DzenPublisher:
         return row
 
     def row_editor(self, page, row):
-        row.get_by_role("button", name="Меню публикации", exact=True).click()
+        # Current Studio draft rows expose the editor URL directly; no search/menu mutation is needed.
+        direct = row.locator('a[href*="/profile/editor/id/"][href$="/edit"]')
+        if direct.count() == 1:
+            return validate_dzen_url(urljoin(page.url, direct.get_attribute("href")))
+        row.get_by_role("button", name="Меню публикации", exact=True).click(timeout=60000)
         link = page.locator('a.Menu-ItemInteractive').filter(has_text=re.compile("^Отредактировать$"))
         return validate_dzen_url(urljoin(page.url, link.get_attribute("href")))
 
-    def document(self, article):
+    def document(self, article, *, require_cover=True):
         row = self.store.one("SELECT payload_json FROM visual_results WHERE article_id=? ORDER BY id DESC LIMIT 1", (article.id,))
         if not row:
             raise UserActionRequired("Нет готовой визуальной сборки Image. Отправка остановлена.")
@@ -110,9 +124,62 @@ class DzenPublisher:
         cover = document.get("cover_file_ref")
         images = [b for b in blocks if isinstance(b, ImageBlock)]
         indexes = [i for i, b in enumerate(images) if cover and b.path.resolve() == Path(cover).resolve()]
-        if len(indexes) != 1:
+        if len(indexes) != 1 and (require_cover or indexes):
             raise UserActionRequired("Обложка должна присутствовать в визуальной сборке ровно один раз.")
-        return blocks, indexes[0]
+        return blocks, indexes[0] if indexes else None
+
+    def collect_statistics(self):
+        """Use only the export control actually observed in this saved channel/profile."""
+        from dzen_agent.browser.statistics_download import download_statistics
+        proof = self.store.settings().get("statistics_export_verification", {})
+        if proof.get("profile_identity") != profile_identity(self.config) or proof.get("adapter_version") != ADAPTER_VERSION:
+            raise UserActionRequired("Экспорт статистики не проверен для сохранённого профиля. Используется локальный импорт.")
+        folder = self.store.database_path.parent / "statistics-exports"
+        folder.mkdir(exist_ok=True)
+        with self.browser() as page:
+            destination = folder / (uuid4().hex + ".xlsx")
+            download_statistics(page, destination, statistics_url=proof["statistics_url"], verified_selector=proof["selector"])
+            parameters = parse_qs(urlsplit(page.locator(proof["selector"]).get_attribute("href")).query)
+            return {"path": str(destination), "from": parameters.get("from", [None])[0],
+                    "to": parameters.get("to", [None])[0], "filter_type": parameters.get("filterType", [None])[0]}
+
+    def create_draft(self, article, detail, image, publication):
+        """Save and reopen an editor draft. Never enter publication settings."""
+        blocks, cover_index = self.document(article, require_cover=False)
+        with self.browser() as page:
+            if publication.get("dzen_url"):
+                remote_title = json.loads(publication.get("evidence_json") or "{}").get("title", article.title)
+                row = self.find(page, remote_title, "draft")
+                if not row or self.row_editor(page, row) != publication["dzen_url"]:
+                    raise UserActionRequired("Сохранённый черновик не найден однозначно. Дубликат не создавался.")
+                page.goto(validate_dzen_url(publication["dzen_url"]), wait_until="domcontentloaded")
+            else:
+                if publication["status"] == "CREATING_DRAFT":
+                    raise UserActionRequired("Адрес созданного черновика неизвестен. Нужна сверка Студии; дубликат заблокирован.")
+                for state in ("pending", "draft"):
+                    if self.find(page, article.title, state):
+                        raise UserActionRequired("В Студии уже есть материал с этим названием. Автоматическое присвоение чужого ID запрещено.")
+                checkpoint(self.store, article.id, "CREATING_DRAFT")
+                page.locator('button[class*="author-studio-header__addButton"]').click()
+                page.get_by_text("Написать статью", exact=True).click()
+                expect(page.locator('[contenteditable=true]')).to_have_count(2, timeout=60000)
+                url = validate_dzen_url(page.url)
+                checkpoint(self.store, article.id, "RENDERING", url=url, dzen_id=urlsplit(url).path.split("/")[-2])
+            editor = DzenEditor(page, self.check_stop)
+            if publication["status"] != "DRAFT_VERIFIED" or publication.get("content_hash") != article_fingerprint(self.store, article.id):
+                editor.replace(article.title, blocks)
+                editor.wait_saved()
+            snapshot = editor.verify(article.title, blocks)
+            url = validate_dzen_url(page.url)
+            row = self.find(page, article.title, "draft")
+            if not row or self.row_editor(page, row) != url:
+                raise UserActionRequired("Черновик не подтверждён в списке Студии.")
+            page.goto(url, wait_until="domcontentloaded")
+            snapshot = DzenEditor(page, self.check_stop).verify(article.title, blocks)
+            return {**snapshot, "dzen_url": url, "dzen_id": urlsplit(url).path.split("/")[-2],
+                    "title": article.title,
+                    "cover_in_document": cover_index is not None, "publicly_published": False,
+                    "image_hashes": [b.sha256 for b in blocks if isinstance(b, ImageBlock)]}
 
     def create_scheduled(self, article, detail, image):
         blocks, cover_index = self.document(article)

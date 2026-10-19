@@ -33,6 +33,16 @@ def similar(first: str, second: str) -> bool:
 
 
 def week_slots(week_start: str, settings: dict) -> list[str]:
+    if settings.get("generation_calendar"):
+        calendar = settings["generation_calendar"]
+        count = sum(calendar.values())
+        if not 1 <= count <= 21 or any(type(n) is not int or not 0 <= n <= 21 for n in calendar.values()):
+            raise ValueError("Укажите от 1 до 21 статьи суммарно.")
+        slots = []
+        for day, number in sorted(calendar.items()):
+            times = ["05:00", "06:00", "16:00"] if number <= 3 else [f"{h:02}:00" for h in range(number)]
+            slots.extend(datetime.fromisoformat(day).replace(hour=int(t[:2]), minute=int(t[3:]), tzinfo=MSK).isoformat() for t in times[:number])
+        return slots[:settings["max_articles_per_week"]]
     start = datetime.fromisoformat(week_start).replace(tzinfo=MSK)
     days = sorted(set(settings["publication_days"]))
     count = settings["max_articles_per_week"]
@@ -83,6 +93,13 @@ def citation_urls(response: dict) -> set[str]:
     return urls
 
 
+def paid_search_urls(store, prefix):
+    urls = set()
+    for receipt in store.rows("SELECT result_json FROM ai_calls WHERE status='SUCCEEDED' AND call_key LIKE ?", (prefix + "%",)):
+        urls.update(citation_urls(json.loads(receipt["result_json"])))
+    return urls
+
+
 def search_evidence_summary(response):
     annotations = [item for choice in response.get("choices", []) if isinstance(choice, dict)
                    for item in (choice.get("message") or {}).get("annotations", []) or [] if isinstance(item, dict)]
@@ -110,7 +127,7 @@ class ContentService:
         self.store = store
         self.provider = provider
         self.settings = settings or store.settings()
-        self.prompts = prompts or Prompts(store).snapshot()
+        self.prompts = Prompts(store).enrich(prompts) if prompts else Prompts(store).snapshot()
         self.run_id = run_id
 
     def context(self, **extra) -> dict:
@@ -121,6 +138,29 @@ class ContentService:
                 "today": datetime.now(MSK).date().isoformat(), **extra}
 
     def structured(self, kind, schema, context, call_key, *, article_id=None, operation=None, image_inputs=None):
+        from dzen_agent.execution import resolved_call
+        base_key = call_key
+        call_key, feedback = resolved_call(self.store, call_key)
+        prior_evidence = set()
+        structural_repair = False
+        if feedback:
+            context = {**context, "validation_feedback": {"error": feedback["error"], "instruction":
+                "Исправь ошибки предыдущего ответа. Не добавляй неподтверждённых фактов или источников."}}
+            previous = self.store.one("SELECT result_json FROM ai_calls WHERE call_key=? AND status='SUCCEEDED'", (feedback["previous_key"],))
+            if previous:
+                paid = json.loads(previous["result_json"])
+                context["previous_response"] = paid["choices"][0]["message"].get("content")
+                structural_repair = feedback.get("category") == "LOCAL_RECOVERABLE"
+                keys = [base_key]
+                repair = self.store.one("SELECT attempt FROM response_repairs WHERE base_key=?", (base_key,))
+                if repair:
+                    keys += [base_key + f":repair:{n}" for n in range(1, repair["attempt"])]
+                for key in keys:
+                    receipt = self.store.one("SELECT result_json FROM ai_calls WHERE call_key=? AND status='SUCCEEDED'", (key,))
+                    if receipt:
+                        prior_evidence.update(citation_urls(json.loads(receipt["result_json"])))
+                context["verified_search_urls_from_paid_responses"] = sorted(prior_evidence)
+        self.last_call_key = call_key
         model_key = {"ANALYTICS": "analytics_model", "DISCOVERY": "discovery_model", "RESEARCH": "research_model",
                      "PLANNER": "planner_model", "WRITER": "writer_model", "IMAGE": "visual_model"}[kind]
         model = self.settings.get(model_key) or (self.settings.get("research_model") if kind in ("DISCOVERY", "IMAGE") else None)
@@ -163,6 +203,8 @@ class ContentService:
         }
         model_limit = self.settings.get("public_catalog", {}).get("chat", {}).get(model, {}).get("max_output")
         if isinstance(model_limit, int) and model_limit > 0:
+            if kind == "PLANNER" and native_contract:
+                payload["max_tokens"] = max(payload["max_tokens"], self.settings["max_articles_per_week"] * 2000)
             payload["max_tokens"] = min(payload["max_tokens"], model_limit)
         if model.rsplit("/", 1)[-1] in ("sonar", "sonar-pro", "sonar-reasoning-pro", "sonar-deep-research", "sonar-pro-search"):
             # Sonar's response_format union accepts text/json_schema, not json_object.
@@ -177,18 +219,33 @@ class ContentService:
             payload["messages"][1]["content"] = dumps(context)
         if image_inputs:
             payload["messages"][1]["content"] = [{"type": "text", "text": dumps(context)}, *image_inputs]
-        if kind in ("RESEARCH", "DISCOVERY", "IMAGE") and not image_inputs and self.settings.get("research_use_web_tool"):
-            payload["tools"] = [{"type": "aitunnel:web_search", "parameters": {"max_uses": 1}}]
-            payload["max_tool_calls"] = 1
+        search_enabled = self.settings.get("visual_use_web_tool", self.settings.get("research_use_web_tool")) if kind == "IMAGE" else self.settings.get("research_use_web_tool")
+        if kind in ("RESEARCH", "DISCOVERY", "IMAGE") and not image_inputs and search_enabled and not structural_repair:
+            # Explicit engine: native providers may ignore max_uses/max_results.
+            payload["tools"] = [{"type": "aitunnel:web_search", "parameters": {
+                "engine": "parallel", "mode": "basic", "max_uses": 3, "max_results": 5,
+                "max_total_results": 15, "max_characters": 5000}}]
+            payload["max_tool_calls"] = 3
         response = self.provider.call(
             call_key=call_key, operation=operation or {"WRITER": "WRITE", "PLANNER": "PLANNING"}
             .get(kind, kind), model=model, payload=payload, run_id=self.run_id, article_id=article_id,
             **({"retry_limit": 0} if ":discovery:topup:" in call_key else {}),
         )
+        if structural_repair and prior_evidence:
+            # A derived validation view only; the paid receipts in ai_calls remain immutable.
+            response = {**response, "citations": sorted(citation_urls(response) | prior_evidence)}
+            self.store.log("REPAIR_PROVENANCE", "Структурное исправление использует поисковую доказательную базу оплаченных ответов без нового поиска", {"call_key":call_key,"previous_key":feedback["previous_key"],"urls":sorted(prior_evidence)})
         from dzen_agent.ai_response import require_complete_response
         require_complete_response(response)
         try:
             content = response["choices"][0]["message"]["content"]
+            from dzen_agent.execution import decode_json, normalize_enums, authoritative_fields
+            decoded, repairs = normalize_enums(decode_json(content), schema)
+            decoded, numeric_repairs = authoritative_fields(decoded, schema, context)
+            repairs.extend(numeric_repairs)
+            if repairs:
+                self.store.log("NORMALIZATION", "Локальная нормализация технических полей ответа", {"call_key": call_key, "repairs": repairs})
+            content = dumps(decoded)
             from dzen_agent.editorial_contracts import DiscoveryV1, ResearchV1
             if schema is DiscoveryV1:
                 from dzen_agent.discovery_validation import parse_discovery
@@ -456,6 +513,14 @@ class ContentService:
         ids = {s["id"] for s in research["sources"]}
         if not set(result.source_ids).issubset(ids):
             raise UserActionRequired("В статье указаны источники, отсутствующие в исследовании.")
+        from dzen_agent.execution import resolved_call
+        paid_key, _ = resolved_call(self.store, call_key)
+        metadata = {"model": self.settings["writer_model"], "prompt_version": self.prompts["WRITER"]["id"],
+                    "call_key": paid_key, "writer_contract": writer_contract}
+        if writer_contract:
+            from dzen_agent.evidence import locate
+            metadata["evidence_alignment"] = [{"fact_id": item["fact_id"], **locate(result.body, item["anchor_text"])}
+                                                for item in writer_contract["evidence_map"]]
         if existing_article:
             self.store.update_content(article_id,
                                       existing_article.title if part == "body" else result.title,
@@ -463,9 +528,7 @@ class ContentService:
             self.store.execute("UPDATE article_details SET short_summary=?,source_ids_json=?,"
                                "metadata_json=?,qa_json=NULL WHERE article_id=?",
                                (result.short_summary, dumps(result.source_ids),
-                                dumps({"model": self.settings["writer_model"],
-                                       "prompt_version": self.prompts["WRITER"]["id"],
-                                       "call_key": call_key, "writer_contract": writer_contract}), article_id))
+                                dumps(metadata), article_id))
             return article_id
         stamp = now_iso()
         with self.store._connect() as conn:
@@ -477,12 +540,10 @@ class ContentService:
                          "short_summary,source_ids_json,metadata_json,scheduled_at) "
                          "VALUES(?,?,?,?,?,?,?,?)", (article_id, concept_row["id"] if concept_row else
                          None, research_id, self.run_id, result.short_summary,
-                         dumps(result.source_ids), dumps({"model": self.settings["writer_model"],
-                         "prompt_version": self.prompts["WRITER"]["id"], "call_key": call_key,
-                         "writer_contract": writer_contract}),
+                         dumps(result.source_ids), dumps(metadata),
                          concept_row["scheduled_at"] if concept_row else None))
-            conn.execute("UPDATE usage_events SET article_id=? WHERE call_key=?",
-                         (article_id, call_key))
+            conn.execute("UPDATE usage_events SET article_id=? WHERE call_key=? OR call_key LIKE ?",
+                         (article_id, call_key, call_key + ":repair:%"))
         return article_id
 
     def image(self, article_id: int, call_key: str, *, force=False) -> int:
@@ -577,18 +638,32 @@ def article_fingerprint(store: Store, article_id: int) -> str:
     image_hash = ""
     if image and Path(image["path"]).is_file():
         image_hash = hashlib.sha256(Path(image["path"]).read_bytes()).hexdigest()
-    return hashlib.sha256(dumps([article.title, article.body, image_hash,
-                                 detail.get("scheduled_at")]).encode()).hexdigest()
+    parts = [article.title, article.body, image_hash, detail.get("scheduled_at")]
+    visual = store.one("SELECT payload_json FROM visual_results WHERE article_id=? ORDER BY id DESC LIMIT 1", (article_id,))
+    if visual:
+        ref = json.loads(visual["payload_json"]).get("assembly", {}).get("assembled_document_ref")
+        if ref and Path(ref).is_file():
+            parts.append(hashlib.sha256(Path(ref).read_bytes()).hexdigest())
+    return hashlib.sha256(dumps(parts).encode()).hexdigest()
 
 
 def qa_article(store: Store, article_id: int) -> dict:
     article, detail, image = store.get(article_id), store.detail(article_id), store.active_image(article_id)
     issues = []
+    from dzen_agent.execution import authorization
+    visual_gap = False
+    inline_gap = False
+    visual = store.one("SELECT payload_json FROM visual_results WHERE article_id=? ORDER BY id DESC LIMIT 1", (article_id,))
+    if authorization(store, detail.get("run_id")) and visual:
+        report = json.loads(visual["payload_json"])
+        visual_gap = report["cover"]["status"] == "unavailable" and report["assembly"]["status"] == "partial"
+        plan = report.get("visual_plan", {})
+        inline_gap = bool(plan.get("missing_sections")) or plan.get("selected_inline_images", 0) < plan.get("expected_inline_images", 0)
     if not article.title.strip():
         issues.append("Пустой заголовок.")
     if not article.body.strip():
         issues.append("Пустой текст.")
-    if not image or not Path(image["path"]).is_file():
+    if (not image or not Path(image["path"]).is_file()) and not visual_gap:
         issues.append("Нет файла обложки.")
     metadata = json.loads(detail.get("metadata_json") or "{}")
     if metadata.get("writer_contract"):
@@ -626,7 +701,7 @@ def qa_article(store: Store, article_id: int) -> dict:
                     following = body[heading.end():].lstrip()
                     if not following.startswith("> Режиссер:") or "> В главных ролях:" not in following.split("\n\n", 1)[0]:
                         issues.append("После заголовка произведения отсутствует блок режиссёра и актёров: " + work.title)
-            issues.extend(validate_visuals(store, article_id))
+            issues.extend(validate_visuals(store, article_id, allow_missing_cover=visual_gap))
         except (ValueError, KeyError, TypeError, OSError) as error:
             issues.append("Не удалось проверить контракты/визуальную сборку: " + str(error))
     research = store.one("SELECT * FROM research_jobs WHERE id=?", (detail.get("research_id"),))
@@ -671,6 +746,9 @@ def qa_article(store: Store, article_id: int) -> dict:
         if missing:
             issues.append("Не завершены этапы: " + ", ".join(sorted(missing)))
     result = {"passed": not issues, "issues": issues, "checked_at": now_iso(),
+              "transfer_ready": not issues and not (visual_gap or inline_gap),
+              "warnings": (["Нет подтверждённой обложки: ограничение оформления и переноса в Дзен."] if visual_gap else [])
+                          + (["Подобраны не все внутренние иллюстрации. Текст доступен для чтения; оформление требует просмотра."] if inline_gap else []),
               "fingerprint": article_fingerprint(store, article_id)}
     store.execute("UPDATE article_details SET qa_json=? WHERE article_id=?", (dumps(result), article_id))
     if not issues and article.status not in (ArticleStatus.APPROVED, ArticleStatus.SCHEDULED,

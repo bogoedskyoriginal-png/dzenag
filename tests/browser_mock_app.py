@@ -38,6 +38,13 @@ studio_spec = importlib.util.spec_from_file_location("studio_ui_fixture", PROJEC
 studio_fixture = importlib.util.module_from_spec(studio_spec)
 studio_spec.loader.exec_module(studio_fixture)
 api = fixture.NativeAPI()
+if os.environ.get("DZEN_UI_TEST_LAYOUT") == "autonomous":
+    # The mock worker uses test model names, so its conservative price catalogue is explicit.
+    test_store = Store(database)
+    if not test_store.settings().get("public_catalog", {}).get("chat", {}).get("analytics-test"):
+        test_store.set_setting("public_catalog", {"chat": {n + "-test": {"context_size":100000,
+            "prompt_cost":1,"completion_cost":1,"max_output":64000,"modalities":{"input":["text","image"]}}
+            for n in ("analytics","discovery","planner","research","writer","visual")}})
 base_topics = list(fixture.TOPICS)
 flags = database.with_suffix(".flags.json")
 if flags.exists():
@@ -104,6 +111,12 @@ def request(self, method, path, **kwargs):
 
 def launch(run_id, **kwargs):
     store = Store(database)
+    if os.environ.get("DZEN_UI_BACKGROUND_MOCK") == "1":
+        import sys
+        with (database.parent / f"worker-{run_id}.log").open("ab") as output:
+            child = subprocess._dzen_test_original_popen([sys.executable, str(PROJECT_ROOT / "tests/background_mock_worker.py"), str(database), str(run_id)],
+                cwd=PROJECT_ROOT, stdout=output, stderr=output, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        return child.pid
     if flags.exists() and json.loads(flags.read_text("utf-8")).get("simulate_running"):
         store.execute("UPDATE pipeline_runs SET status='RUNNING' WHERE id=?", (run_id,))
         return 123
@@ -126,10 +139,12 @@ def forbidden(*args, **kwargs):
 
 
 config_module.get_settings = lambda: config
+if not hasattr(subprocess, "_dzen_test_original_popen"):
+    subprocess._dzen_test_original_popen = subprocess.Popen
 AITunnel._request = request
 AITunnel.call = mock_call
 scheduler_module.launch_pipeline = launch
 visuals_module.fetch_public = fetch
 httpx.Client.request = forbidden
 subprocess.Popen = forbidden
-runpy.run_path(str(PROJECT_ROOT / "dzen_agent/ui.py"), run_name="__main__")
+runpy.run_path(str(PROJECT_ROOT / ("dzen_agent/ui.py" if os.environ.get("DZEN_UI_TEST_LAYOUT") == "autonomous" else "dzen_agent/ui_legacy.py")), run_name="__main__")

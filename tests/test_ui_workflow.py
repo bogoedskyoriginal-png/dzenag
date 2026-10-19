@@ -77,7 +77,7 @@ def test_unknown_planner_result_has_clear_reason_and_no_automatic_resume(tmp_pat
     store.execute("INSERT INTO ai_calls(call_key,status,created_at,updated_at) VALUES('run:1:plan','UNCERTAIN','2030','2030')")
     config = replace(get_settings(), database_path=store.database_path, aitunnel_api_key="mock-key")
     with patch("dzen_agent.config.get_settings", return_value=config), patch("dzen_agent.scheduler.launch_pipeline") as launch:
-        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent/ui.py"), default_timeout=20).run()
+        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent/ui_legacy.py"), default_timeout=20).run()
         next(x for x in app.button if x.label == "Разобраться с ошибкой").click().run()
         assert not app.exception
         assert any("Ответ AI-сервиса не подтверждён" in x.value for x in app.markdown)

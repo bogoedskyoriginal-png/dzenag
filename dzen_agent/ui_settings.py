@@ -44,6 +44,7 @@ def model_settings(store, config):
                 st.caption(f"Каталог: ввод {info.get('prompt_cost', '—')} ₽ / 1 млн токенов · выход {info.get('completion_cost', '—')} ₽ / 1 млн. Поиск может оплачиваться отдельно.")
         values["image_model"] = st.text_input("Модель генерации обложек для старого формата Image", settings["image_model"])
         values["research_use_web_tool"] = st.checkbox("Добавлять инструмент веб-поиска AITUNNEL", settings["research_use_web_tool"], help="Sonar использует встроенный поиск. Дополнительный поиск оплачивается отдельно.")
+        values["visual_use_web_tool"] = st.checkbox("Поиск фотографий через AITUNNEL", settings.get("visual_use_web_tool", settings["research_use_web_tool"]), help="Для Visual-модели без собственного поиска. Просмотр скачанных фото не запускает повторный поиск.")
         qualities = ["low", "medium", "high", "auto"]
         values["image_quality"] = st.selectbox("Качество генерации для старого Image", qualities, index=qualities.index(settings["image_quality"]))
         if st.form_submit_button("Сохранить модели"):

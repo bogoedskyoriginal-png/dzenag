@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS articles (
  id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, title TEXT NOT NULL,
@@ -174,6 +174,19 @@ CREATE TABLE pipeline_items (
 """
 
 
+AUTONOMY_SCHEMA = """
+CREATE TABLE prompt_contracts(prompt_id INTEGER PRIMARY KEY REFERENCES prompt_versions(id), stage TEXT NOT NULL, version TEXT NOT NULL);
+CREATE TABLE run_authorizations(run_id INTEGER PRIMARY KEY REFERENCES pipeline_runs(id), budget_rub REAL NOT NULL,
+ reserve_rub REAL NOT NULL, max_calls INTEGER NOT NULL, max_repairs INTEGER NOT NULL, authorized_at TEXT NOT NULL,
+ policy_json TEXT NOT NULL);
+CREATE TABLE call_reservations(call_key TEXT PRIMARY KEY,run_id INTEGER NOT NULL REFERENCES pipeline_runs(id),
+ reserved_rub REAL NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE plan_approvals(id INTEGER PRIMARY KEY,plan_id INTEGER NOT NULL REFERENCES content_plans(id),revision INTEGER NOT NULL,
+ actor TEXT NOT NULL,mode TEXT NOT NULL,conditions_json TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(plan_id,revision));
+CREATE TABLE response_repairs(base_key TEXT PRIMARY KEY,attempt INTEGER NOT NULL,feedback TEXT NOT NULL,updated_at TEXT NOT NULL);
+"""
+
+
 def migrate(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path, timeout=30) as conn:
@@ -193,7 +206,7 @@ def migrate(path: Path) -> None:
         try:
             # Another process may have migrated while we acquired the write lock.
             current = conn.execute("PRAGMA user_version").fetchone()[0]
-            for target, script in ((1, SCHEMA), (2, EDITORIAL_SCHEMA), (3, ANALYTICS_SCHEMA), (4, VISUAL_SCHEMA), (5, RESILIENCE_SCHEMA)):
+            for target, script in ((1, SCHEMA), (2, EDITORIAL_SCHEMA), (3, ANALYTICS_SCHEMA), (4, VISUAL_SCHEMA), (5, RESILIENCE_SCHEMA), (6, AUTONOMY_SCHEMA)):
                 if current < target:
                     for statement in script.split(";"):
                         if statement.strip():

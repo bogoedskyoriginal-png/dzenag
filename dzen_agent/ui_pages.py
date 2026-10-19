@@ -235,7 +235,7 @@ def statistics_page(store, config):
                     store.execute("UPDATE statistics_imports SET metadata_json=? WHERE id=?", (dumps(value), selected))
                     return True
                 action("Сохраняю сведения…", save_metadata)
-    st.caption("Автоматическая загрузка: " + CSV_DOWNLOAD_STATUS)
+    st.caption("Автоматическая загрузка: " + ("кнопка экспорта проверена; управление — в подключениях" if store.settings().get("statistics_export_verification") else CSV_DOWNLOAD_STATUS))
     if st.button("Открыть Дзен для входа / диагностики", key="stats-login"):
         action("Открываю браузер…", launch_session)
 
@@ -276,8 +276,11 @@ def prompts_page(store, config):
     with editor, st.form(f"prompt-{kind}-{active['id']}"):
         title = st.text_input("Название", value=active["title"])
         content = st.text_area("Текст промпта", value=active["content"], height=400)
+        versions = ["1.0", "legacy"]
+        contract_version = st.selectbox("Технический контракт", versions, index=versions.index(active.get("contract_version", "legacy")),
+                                       help="Версия хранится отдельно от авторского текста.")
         if st.form_submit_button("Сохранить новую версию", type="primary"):
-            if action("Сохраняю версию…", lambda: prompts.save(kind, title, content)):
+            if action("Сохраняю версию…", lambda: prompts.save(kind, title, content, contract_version=contract_version)):
                 st.rerun()
     with st.expander("Переменные шаблона"):
         st.caption(", ".join("{{" + v + "}}" for v in sorted(VARIABLES)))

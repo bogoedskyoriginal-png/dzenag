@@ -35,3 +35,19 @@ def test_dzen_url_rejects_other_domains():
                 "https://name:password@dzen.ru"):
         with pytest.raises(ValueError):
             validate_dzen_url(url)
+
+
+def test_draft_editor_url_is_read_from_observed_row_without_menu_mutation(tmp_path):
+    from dzen_agent.browser.publisher import DzenPublisher
+    store = Store(tmp_path / "db.sqlite")
+    store.initialize()
+    page, row, link = Mock(), Mock(), Mock()
+    page.url = "https://dzen.ru/profile/editor/channel/publications"
+    row.locator.return_value = link
+    link.count.return_value = 1
+    link.get_attribute.return_value = "/profile/editor/id/channel/one/edit"
+    assert DzenPublisher(store).row_editor(page, row) == "https://dzen.ru/profile/editor/id/channel/one/edit"
+    row.get_by_role.assert_not_called()
+    link.get_attribute.return_value = "https://dzen.ru.evil.com/profile/editor/id/channel/one/edit"
+    with pytest.raises(ValueError):
+        DzenPublisher(store).row_editor(page, row)

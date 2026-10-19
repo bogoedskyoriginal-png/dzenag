@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from dzen_agent.errors import UserActionRequired
+from dzen_agent.errors import UserActionRequired, redact
 from dzen_agent.services import article_fingerprint
 from dzen_agent.store import Store, dumps, now_iso
 
@@ -34,6 +34,29 @@ class DzenScheduling:
                 raise UserActionRequired("Автономная отправка не разрешена в настройках Дзена.")
         elif article.status != "APPROVED":
             raise UserActionRequired("Сначала утвердите актуальный материал.")
+
+    def collect_statistics(self):
+        from pathlib import Path
+        from dzen_agent.analytics_input import validate_metadata
+        from dzen_agent.statistics import preview_statistics, import_statistics
+        self._ready()
+        evidence = self.adapter.collect_statistics()
+        path = Path(evidence["path"])
+        preview = preview_statistics(path.read_bytes(), path.name)
+        if "title" not in preview.mapping.values() or not ({"impressions", "opens", "reads", "views"} & set(preview.mapping.values())):
+            raise UserActionRequired("Столбцы выгрузки изменились. Нужна ручная проверка импорта.")
+        existing = self.store.one("SELECT id FROM statistics_imports WHERE sha256=?", (preview.sha256,))
+        import_id = import_statistics(self.store, path.name, preview)
+        if not existing:
+            row = self.store.one("SELECT metadata_json FROM statistics_imports WHERE id=?", (import_id,))
+            metadata = json.loads(row["metadata_json"])
+            metadata["source"].update(downloaded_at=now_iso(), origin="authorized_studio_export", export_filter=evidence["filter_type"])
+            if evidence["filter_type"] == "by-event" and evidence["from"] and evidence["to"]:
+                metadata.update(measurement_window="calendar_period", period={"start":evidence["from"], "end":evidence["to"], "as_of":None,"timezone":"Europe/Moscow"})
+            metadata = validate_metadata(metadata)
+            self.store.execute("UPDATE statistics_imports SET metadata_json=? WHERE id=?", (dumps(metadata), import_id))
+        self.store.log("STATISTICS_EXPORT", "Оригинальная выгрузка получена из авторизованной Студии; прежние импорты сохранены", {"import_id":import_id, **evidence})
+        return import_id
 
     def _validate_schedule(self, article_id, detail):
         from dzen_agent.browser.editor import publication_time
@@ -63,6 +86,34 @@ class DzenScheduling:
         # Persist intent before the remote side effect; never blindly repeat it.
         return self._perform(article_id, lambda: self.adapter.create_scheduled(
             article, detail, self.store.active_image(article_id)))
+
+    def create_draft(self, article_id, *, run_id):
+        from dzen_agent.execution import authorization
+        from dzen_agent.services import qa_article
+        self._ready()
+        grant = authorization(self.store, run_id)
+        if not grant or not json.loads(grant["policy_json"])["drafts"]:
+            raise UserActionRequired("Создание черновиков отдельно не разрешено.")
+        check = qa_article(self.store, article_id)
+        if not check["passed"]:
+            raise UserActionRequired("Материал не прошёл QA: " + "; ".join(check["issues"]))
+        publication = self.store.one("SELECT * FROM publications WHERE article_id=?", (article_id,))
+        if publication and publication["status"] == "SCHEDULED_VERIFIED":
+            return publication
+        if publication and publication["status"] == "CREATING_DRAFT" and not publication["dzen_url"]:
+            raise UserActionRequired("Неизвестен адрес созданного черновика. Дубликат заблокирован до сверки Студии.")
+        if not publication:
+            self.store.execute("INSERT INTO publications(article_id,status,updated_at) VALUES(?,'PREPARING_DRAFT',?)", (article_id, now_iso()))
+            publication = self.store.one("SELECT * FROM publications WHERE article_id=?", (article_id,))
+        try:
+            result = self.adapter.create_draft(self.store.get(article_id), self.store.detail(article_id), self.store.active_image(article_id), publication)
+            self.store.execute("UPDATE publications SET status='DRAFT_VERIFIED',dzen_url=?,dzen_id=?,content_hash=?,"
+                               "verified_at=?,evidence_json=?,error=NULL,updated_at=? WHERE article_id=?",
+                               (result["dzen_url"], result["dzen_id"], article_fingerprint(self.store, article_id), now_iso(), dumps(result), now_iso(), article_id))
+            return result
+        except Exception as error:
+            self.store.execute("UPDATE publications SET error=?,updated_at=? WHERE article_id=?", (redact(str(error)), now_iso(), article_id))
+            raise
 
     def _perform(self, article_id, operation):
         from dzen_agent.errors import redact

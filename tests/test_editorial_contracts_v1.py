@@ -138,11 +138,14 @@ class NativeAPI:
                 asset.update(context["tool_results"]["assets"][0])
                 asset["authenticity_status"] = "verified"
                 placement = example("image", 2)
+                placement["asset_id"] = asset["asset_id"]
                 placement.update(target_section_heading=concept["topic"], anchor_text="В главных ролях: Актёр")
                 output["placements"] = [placement]
             no_images = self.no_images or concept["concept_id"] == self.no_images_for
             output["assets"] = [] if no_images else [asset]
             output["cover"].update(source_asset_id=None if no_images else "IMG001", cover_text=concept["topic"])
+            if inspecting and not no_images:
+                output["cover"]["source_asset_id"] = asset["asset_id"]
         self.outputs[(stage, inspecting)] = copy.deepcopy(output)
         return httpx.Response(200, json={"choices": [{"message": {"content": "{}" if stage == self.fail_json else dumps(output)}}],
             "citations": ["https://example.com/r1", "https://example.com/photos"] + [f"https://example.com/d{i}" for i in range(21)],
@@ -156,7 +159,7 @@ def native_run(tmp_path, monkeypatch):
     prompts = Prompts(store)
     prompts.seed()
     for stage in ("discovery", "planner", "research", "writer", "image"):
-        prompts.save(stage.upper(), "Author contract", dumps({"contract_version": "1.0", "stage": stage}))
+        prompts.save(stage.upper(), "Author contract", dumps({"contract_version": "1.0", "stage": stage}), contract_version="1.0")
     for role in ("analytics", "discovery", "planner", "research", "writer", "visual"):
         store.set_setting(role + "_model", role + "-test")
     store.set_setting("max_output_tokens", 64000)
@@ -171,6 +174,8 @@ def native_run(tmp_path, monkeypatch):
     def fetch(url, limit=None):
         if api.fail_download:
             raise httpx.ReadTimeout("download failed")
+        if api.no_images or (api.no_images_for and api.outputs.get(("image", False), {}).get("concept_id") == api.no_images_for):
+            return b"<html>No suitable images</html>"
         return picture.getvalue() if url.endswith(".jpg") else b'<img src="https://example.com/still.jpg">'
     monkeypatch.setattr("dzen_agent.visuals.fetch_public", fetch)
     provider = AITunnel(store, "test-key", httpx.Client(transport=httpx.MockTransport(api.handler)))
@@ -399,7 +404,7 @@ def test_twenty_one_concepts_and_custom_slots_render_in_streamlit(native_run):
     assert Pipeline(store, provider).execute(run) == "AWAITING_PLAN_REVIEW"
     config = replace(get_settings(), database_path=store.database_path, aitunnel_api_key=None)
     with patch("dzen_agent.config.get_settings", return_value=config):
-        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent/ui.py"), default_timeout=20).run()
+        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent/ui_legacy.py"), default_timeout=20).run()
         app.sidebar.radio[0].set_value("Контент-план").run()
         assert not app.exception and not app.error
         next(x for x in app.radio if x.label == "Представление плана").set_value("Все концепты").run()

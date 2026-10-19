@@ -168,7 +168,11 @@ class AITunnel:
                             "Проверьте диагностику и явно разрешите новый запрос в разделе восстановления. "
                             + (previous["error"] or ""))
             self.guard()
+            from dzen_agent.execution import authorization, reserve_call, settle_call
+            reserve_call(self.store, run_id, call_key, model, payload, image_path)
             retries = min(3, max(0, int(self.store.settings()["max_retries"])))
+            if authorization(self.store, run_id):
+                retries = 0  # Retry decisions belong to the execution policy and its ledger.
             if retry_limit is not None:
                 retries = min(retries, max(0, retry_limit))
             for attempt in range(retries + 1):
@@ -205,6 +209,7 @@ class AITunnel:
                             "UPDATE ai_calls SET status='SUCCEEDED',result_json=?,error=NULL,"
                             "updated_at=? WHERE call_key=?", (dumps(result), now_iso(), call_key),
                         )
+                    settle_call(self.store, call_key)
                     return result
                 except Exception as error:
                     # A timeout/5xx or invalid paid response can have incurred a charge.
@@ -244,6 +249,7 @@ class AITunnel:
                                          (dumps({"http_error": diagnostic}), call_key))
                     self.store.log(operation, message, {"model": model, "request_id": request_id,
                                                        "http_status": status_code})
+                    settle_call(self.store, call_key, uncertain)
                     if status_code == 429 and attempt < retries:
                         time.sleep(min(2 ** attempt, 4))
                         self.guard()

@@ -14,7 +14,7 @@ from dzen_agent.prompt_service import Prompts
 def test_all_sections_render_without_key(tmp_path):
     config = replace(get_settings(), database_path=tmp_path / "ui.db", aitunnel_api_key=None)
     with patch("dzen_agent.config.get_settings", return_value=config):
-        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui.py"), default_timeout=20).run()
+        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui_legacy.py"), default_timeout=20).run()
         assert not app.exception
         for section in ["Рабочий стол", "Контент-план", "Материалы", "Аналитика", "Настройки", "Система"]:
             app.sidebar.radio[0].set_value(section).run()
@@ -25,7 +25,7 @@ def test_all_sections_render_without_key(tmp_path):
 def test_manual_article_and_prompt_edit(tmp_path):
     config = replace(get_settings(), database_path=tmp_path / "ui.db", aitunnel_api_key=None)
     with patch("dzen_agent.config.get_settings", return_value=config):
-        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui.py"), default_timeout=20).run()
+        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui_legacy.py"), default_timeout=20).run()
         app.sidebar.radio[0].set_value("Материалы").run()
         next(x for x in app.text_input if x.label == "Заголовок своего текста").set_value("Мой текст")
         next(x for x in app.text_area if x.label == "Свой текст").set_value("Содержимое статьи")
@@ -48,7 +48,7 @@ def test_editorial_chat_apply_and_approve_plan(editorial_plan):
              "proposals": [{"type": "update_concept", "concept_id": ids[0],
                             "angle": "Как ремесленники решали технические задачи", "reason": "Уйти от подборки"}]})}}]}
     with patch("dzen_agent.config.get_settings", return_value=config) as config_mock:
-        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui.py"), default_timeout=20).run()
+        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui_legacy.py"), default_timeout=20).run()
         app.sidebar.radio[0].set_value("Контент-план").run()
         config_mock.return_value = replace(config, aitunnel_api_key="test-key")
         app.run()
@@ -82,7 +82,7 @@ def test_v1_report_period_metadata_and_missing_discovery_prompt(tmp_path, analyt
     store.execute("INSERT INTO analytics_results(statistics_id,payload_json,created_at) VALUES(?,?,?)",
                    (import_id, dumps(analytics_v1), "2026-10-18"))
     with patch("dzen_agent.config.get_settings", return_value=config):
-        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui.py"), default_timeout=20).run()
+        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui_legacy.py"), default_timeout=20).run()
         app.sidebar.radio[0].set_value("Аналитика").run()
         assert not app.exception and not app.error
         assert any("Анализ статистики" in x.value for x in app.caption)
@@ -113,7 +113,7 @@ def test_analytics_retry_ui_requires_consent_and_launches_only_one_stage(tmp_pat
     store.execute("INSERT INTO ai_calls(call_key,status,result_json,created_at,updated_at) VALUES(?,'SUCCEEDED',?,'2030','2030')",
                   (key, dumps(response)))
     with patch("dzen_agent.config.get_settings", return_value=config), patch("dzen_agent.scheduler.launch_pipeline") as launch:
-        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui.py"), default_timeout=20).run()
+        app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent" / "ui_legacy.py"), default_timeout=20).run()
         app.sidebar.radio[0].set_value("Аналитика").run()
         assert not app.exception and not app.error
         assert any("публикаций обработано: 1" in x.value for x in app.markdown)

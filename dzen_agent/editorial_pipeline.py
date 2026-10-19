@@ -2,19 +2,17 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timedelta
 
 from dzen_agent.analytics_contract import briefs
 from dzen_agent.editorial_contracts import DiscoveryV1, PlannerV1, ResearchV1, WriterV1, refs
 from dzen_agent.errors import UserActionRequired
 from dzen_agent.schemas import Concept, Research, WrittenArticle
-from dzen_agent.store import MSK, now_iso
+from dzen_agent.store import MSK, now_iso, dumps
 
 
 def native(prompt, stage):
-    return bool(prompt and re.search(r'"contract_version"\s*:\s*"1\.0"', prompt["content"])
-                and re.search(r'"stage"\s*:\s*"' + stage + r'"', prompt["content"]))
+    return bool(prompt and prompt.get("contract_version") == "1.0" and prompt.get("contract_stage") == stage)
 
 
 def preflight(settings, prompts):
@@ -26,18 +24,32 @@ def preflight(settings, prompts):
                                  "Авторские промпты не изменены.")
     if stages["image"] and not stages["writer"]:
         raise UserActionRequired("Image 1.0 требует Writer 1.0.")
-    if stages["planner"] and settings["max_articles_per_week"] > 5 and settings["max_output_tokens"] < settings["max_articles_per_week"] * 2000:
-        raise UserActionRequired("Для подробного плана такого объёма увеличьте лимит выходных токенов "
-                                 f"до {settings['max_articles_per_week'] * 2000} или выше в настройках. "
-                                 "Запрос ещё не оплачивался.")
+    catalog = settings.get("public_catalog", {}).get("chat", {})
+    for stage, key in (("discovery", "discovery_model"), ("research", "research_model"), ("image", "visual_model")):
+        model = settings.get(key) or settings.get("research_model")
+        details = catalog.get(model, {})
+        search_enabled = settings.get("visual_use_web_tool", settings.get("research_use_web_tool")) if stage == "image" else settings.get("research_use_web_tool")
+        if stages[stage] and details.get("provider") and details["provider"] != "perplexity" and not search_enabled:
+            raise UserActionRequired("Для выбранной модели " + str(model) + " нужен инструмент веб-поиска. Включите его в настройках моделей до запуска; запрос ещё не оплачивался.")
+        if stage == "image" and stages[stage] and details.get("modalities") and "image" not in details["modalities"].get("input", []):
+            raise UserActionRequired("Выбранная Visual-модель не принимает изображения. Выберите модель с визуальным входом до оплаты запросов.")
+    if stages["planner"] and settings["max_articles_per_week"] > 5:
+        needed = settings["max_articles_per_week"] * 2000
+        limit = catalog.get(settings.get("planner_model"), {}).get("max_output")
+        effective = min(max(settings["max_output_tokens"], needed), limit) if isinstance(limit, int) and limit > 0 else settings["max_output_tokens"]
+        if effective < needed:
+            raise UserActionRequired("Модель Planner не позволяет подготовить подробный план такого объёма. Выберите модель с лимитом ответа не меньше " + str(needed) + " токенов либо уменьшите количество статей. Запрос ещё не оплачивался.")
 
 
 def run_context(service):
     run = service.store.one("SELECT * FROM pipeline_runs WHERE id=?", (service.run_id,))
     start = run["week_start"] if run else None
+    calendar = service.settings.get("generation_calendar")
+    if calendar:
+        start = min(calendar)
     return {"run_id": service.run_id, "as_of": datetime.now(MSK).date().isoformat(),
             "timezone": "Europe/Moscow", "planning_window": {"start": start,
-                "end": (datetime.fromisoformat(start) + timedelta(days=6)).date().isoformat() if start else None,
+                "end": max(calendar) if calendar else ((datetime.fromisoformat(start) + timedelta(days=6)).date().isoformat() if start else None),
                 "timezone": "Europe/Moscow"}}
 
 
@@ -49,7 +61,7 @@ def editorial_config(service):
             "maximum_length_chars": service.settings.get("maximum_length_chars", 12000),
             "subscription_heading": "## Прежде, чем перейти к чтению - пожалуйста, подпишитесь на канал. Ваша поддержка очень важна для нас.",
             "final_heading": "## Ставьте лайки и подписывайтесь на Перемотку!",
-            "editorial_restrictions": [], "additional_requirements": []}
+            "editorial_restrictions": [], "additional_requirements": [service.settings["editorial_wishes"]] if service.settings.get("editorial_wishes") else []}
 
 
 def history(service):
@@ -81,6 +93,7 @@ def discover(service, analytics, call_key, *, additional=None):
     published, scheduled = history(service)
     context = {"run_context": run_context(service), "editorial_config": editorial_config(service),
         "analytics": {**analytics, "discovery_brief": discovery_brief}, "published_articles": published,
+        "editorial_wishes": service.settings.get("editorial_wishes", ""),
         "scheduled_articles": scheduled, "editorial_backlog": service.store.rows(
             "SELECT c.id,c.topic,c.scheduled_at,c.status FROM concepts c ORDER BY c.id DESC LIMIT 100"),
         "audience_signals": None, "search_config": {"target_candidates": service.settings["max_articles_per_week"] + 3,
@@ -279,6 +292,14 @@ def research(service, row, call_key):
         "editorial_config": editorial_config(service), "research_config": {
             "search_depth": "deep", "max_sources": 12, "preferred_domains": [], "excluded_domains": [],
             "additional_requirements": []}}
+    pending = service.store.one("SELECT payload_json FROM research_jobs WHERE id=?", (row["research_id"],))
+    saved = json.loads(pending["payload_json"]) if pending else {}
+    prior = saved.get("previous_research") or saved.get("editorial_contract")
+    if prior:
+        context["previous_research"] = prior
+        context["research_config"]["additional_requirements"].append(
+            "Проверь достаточность именно актуального concept.key_thesis, а не прежнего original_thesis из досье. "
+            "Сохрани корректные факты прежнего досье; оно не было готово к Writer.")
     result, response = service.structured("RESEARCH", ResearchV1, context, call_key)
     if response.get("research_validation"):
         service.store.log("RESEARCH_VALIDATION", "Локальная проверка ссылок Research; оплаченный ответ сохранён без изменений",
@@ -287,6 +308,16 @@ def research(service, row, call_key):
     if (result.concept_id, result.concept_revision) != (concept["concept_id"], concept["revision"]):
         raise ValueError("Research изменил идентификатор или версию утверждённого концепта.")
     allowed = citation_urls(response)
+    if prior:
+        # Incremental research may reuse already paid search evidence, but never model-declared URLs alone.
+        prior_sources = {str(s.url).rstrip("/") for s in ResearchV1.model_validate(prior).sources}
+        history_prefix = call_key.rsplit(":v", 1)[0] + ":v"
+        from dzen_agent.services import paid_search_urls
+        observed = paid_search_urls(service.store, history_prefix)
+        reused = prior_sources & observed
+        allowed |= reused
+        if reused:
+            service.store.log("RESEARCH_PROVENANCE", "Использованы поисковые источники сохранённого досье, подтверждённые прежними квитанциями", {"run_id": service.run_id, "concept_id": row["id"], "urls": sorted(reused)})
     grounded = all(str(s.url).rstrip("/") in allowed for s in result.sources)
     ready = (result.status in ("ok", "partial") and result.research_status == "ready"
         and result.writer_handoff.sufficiency.coverage == "sufficient" and grounded
@@ -310,8 +341,14 @@ def research(service, row, call_key):
             conn.execute("INSERT INTO research_sources(research_id,source_id,url,title,publication_date,excerpt) "
                 "VALUES(?,?,?,?,?,?)", (job_id, source.id, str(source.url), source.title, source.publication_date, source.excerpt))
     if not ready:
-        raise UserActionRequired("Research требует дополнительной проверки: " + result.status + "/" + result.research_status
-                                 + ". Досье и оплаченный ответ сохранены, Writer не запущен.")
+        from dzen_agent.errors import EditorialBlocker
+        raise EditorialBlocker("Research требует дополнительной проверки: " + result.status + "/" + result.research_status
+                               + ". thesis_status=" + result.concept_validation.thesis_status
+                               + "; coverage=" + result.writer_handoff.sufficiency.coverage
+                               + "; missing_sections=" + dumps(result.writer_handoff.sufficiency.missing_sections)
+                               + "; unverified_urls=" + dumps([str(s.url) for s in result.sources if str(s.url).rstrip('/') not in allowed])
+                               + ". Проверяй достаточность для текущего concept.key_thesis. Досье и оплаченный ответ сохранены, Writer не запущен.",
+                               reframe=result.concept_validation.thesis_status != "supported" and bool(result.concept_validation.proposed_change))
     return job_id
 
 
@@ -324,7 +361,7 @@ def write(service, row, research_payload, call_key, existing_article=None, part=
         raise UserActionRequired("Research не готов к Writer.")
     context = {"run_context": run_context(service), "concept": concept,
         "research": research_result.model_dump(mode="json"), "editorial_config": editorial_config(service),
-        "editorial_materials": {"writing_mode": "new_article" if not existing_article else "rewrite",
+        "editorial_materials": {"writing_mode": "from_scratch" if not existing_article else "rewrite_draft",
             "author_notes": [] if part == "all" else ["Измените только " + ("заголовок" if part == "title" else "текст")
                 + "; остальные части переданного текста сохраните дословно."],
             "draft_text": existing_article.body if existing_article else None, "outline": None, "approved_opinions": []}}

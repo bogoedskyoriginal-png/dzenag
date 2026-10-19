@@ -59,7 +59,7 @@ def saved_run(tmp_path, analytics_v1):
     store = Store(tmp_path / "replay.db")
     store.initialize()
     Prompts(store).seed()
-    Prompts(store).save("DISCOVERY", "Авторский промпт", dumps({"contract_version": "1.0", "stage": "discovery"}))
+    Prompts(store).save("DISCOVERY", "Авторский промпт", dumps({"contract_version": "1.0", "stage": "discovery"}), contract_version="1.0")
     store.set_setting("max_articles_per_week", 2)
     store.set_setting("discovery_model", "sonar")
     run_id = create_run(store, "2030-01-07")
@@ -201,7 +201,7 @@ def test_ui_offline_replay_needs_no_key_and_shows_shortfall(saved_run, monkeypat
     monkeypatch.setattr("dzen_agent.config.get_settings", lambda: config)
     monkeypatch.setattr("dzen_agent.scheduler.launch_pipeline", forbidden)
     monkeypatch.setattr("httpx.Client.request", forbidden)
-    app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent/ui.py"), default_timeout=20).run()
+    app = AppTest.from_file(str(PROJECT_ROOT / "dzen_agent/ui_legacy.py"), default_timeout=20).run()
     next(b for b in app.button if b.label == "Разобраться с ошибкой").click().run()
     button = next(b for b in app.button if b.label == "Обработать сохранённый Discovery бесплатно")
     assert not button.disabled

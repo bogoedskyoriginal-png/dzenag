@@ -554,13 +554,15 @@ class WriterV1(Contract):
             raise ValueError("Writer изменил идентификатор или версию концепта.")
         for evidence in self.evidence_map:
             refs([evidence.fact_id], research.writer_handoff.approved_fact_ids, "evidence_map")
-            if evidence.anchor_text not in self.content.article_markdown:
-                raise ValueError("Evidence anchor отсутствует в статье.")
+            from dzen_agent.evidence import locate
+            if not locate(self.content.article_markdown, evidence.anchor_text):
+                raise ValueError(f"Evidence anchor отсутствует в статье: {evidence.fact_id}: {evidence.anchor_text}")
         for quote in self.quotes_used:
             refs([quote.quote_id], research.writer_handoff.approved_quote_ids, "quotes_used")
             original = next(q for q in research.quotes if q.quote_id == quote.quote_id)
-            if quote.anchor_text not in self.content.article_markdown or not any(
-                    text and text in quote.anchor_text for text in (original.exact_text, original.translation)):
+            from dzen_agent.evidence import plain
+            if not locate(self.content.article_markdown, quote.anchor_text, contextual_year=False) or not any(
+                    text and plain(text) in plain(quote.anchor_text) for text in (original.exact_text, original.translation)):
                 raise ValueError("Цитата Writer не совпадает с Research.")
         for issue in self.issues:
             refs(issue.related_fact_ids, {f.fact_id for f in research.facts}, "related_fact_ids")

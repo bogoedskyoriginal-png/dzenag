@@ -38,6 +38,17 @@ def test_all_invalid_reference_paths_are_reported():
     assert all(i["expected"] == ["S001"] for i in issues)
 
 
+def test_duplicate_source_diagnostics_keep_all_original_reference_errors():
+    data = dossier()
+    data["sources"].append({**data["sources"][0], "url":"https://example.com/different"})
+    data["facts"][0]["source_ids"].append("S404")
+    with pytest.raises(ResearchReferenceError) as caught:
+        parse_research(dumps(data))
+    assert len([i for i in caught.value.issues if i["type"] == "duplicate_identity"]) == 2
+    assert any(i["actual"] == "S404" for i in caught.value.issues)
+    assert len(data["facts"]) == 1
+
+
 @pytest.mark.parametrize("reference", [" S001 ", "s001", "S1", "Ｓ００１", "s-0001"])
 def test_normalizes_unambiguous_ids_without_mutating_receipt(reference):
     data = dossier()

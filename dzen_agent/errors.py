@@ -12,6 +12,12 @@ class UserActionRequired(RuntimeError):
     pass
 
 
+class EditorialBlocker(UserActionRequired):
+    def __init__(self, message, *, reframe=False):
+        self.reframe = reframe
+        super().__init__(message)
+
+
 def redact(text: str) -> str:
     for secret in (get_settings().aitunnel_api_key, get_settings().openai_api_key):
         if secret:

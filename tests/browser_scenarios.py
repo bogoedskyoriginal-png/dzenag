@@ -37,7 +37,7 @@ def main():
     prompts = Prompts(store)
     prompts.seed()
     for role in ("discovery", "planner", "research", "writer", "image"):
-        prompts.save(role.upper(), "Mock contract", dumps({"contract_version": "1.0", "stage": role}))
+        prompts.save(role.upper(), "Mock contract", dumps({"contract_version": "1.0", "stage": role}), contract_version="1.0")
     for role in ("analytics", "discovery", "planner", "research", "writer", "visual"):
         store.set_setting(role + "_model", role + "-test")
     for key, value in {"max_output_tokens": 64000, "publication_days": list(range(7)),

@@ -165,7 +165,7 @@ def test_large_plain_error_is_redacted_before_truncation_and_malformed_usage_doe
 def test_discovery_resume_requires_consent_skips_successful_analytics_and_keeps_history(store, analytics_v1, monkeypatch):
     prompts = Prompts(store)
     for stage in ("DISCOVERY", "PLANNER", "RESEARCH", "WRITER"):
-        prompts.save(stage, "Author " + stage, dumps({"contract_version": "1.0", "stage": stage.lower()}))
+        prompts.save(stage, "Author " + stage, dumps({"contract_version": "1.0", "stage": stage.lower()}), contract_version="1.0")
     store.set_setting("research_model", "sonar")  # Same fallback as the real failed run.
     store.set_setting("max_articles_per_week", 1)
     run_id = create_run(store, "2030-01-07")

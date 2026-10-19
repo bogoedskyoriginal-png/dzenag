@@ -45,6 +45,11 @@ def identifiers(data):
 def inspect_references(data):
     ids = identifiers(data)
     issues = []
+    for group, values in ids.items():
+        for index, value in enumerate(values):
+            if values.count(value) > 1:
+                issues.append({"path": [group, index, IDENTITIES[group]], "actual": value,
+                               "expected": "unique identifier", "type": "duplicate_identity"})
     for _, key, values, path in reference_entries(data):
         expected = sorted({v for group in TARGETS[key] for v in ids[group]})
         if key == "approved_fact_ids":
@@ -72,6 +77,9 @@ def parse_research(content):
         return ResearchV1.model_validate(raw), {"issues": [], "repairs": [], "quarantined": []}
     data = copy.deepcopy(raw)
     report = {"issues": inspect_references(raw), "repairs": [], "quarantined": []}
+    # Ambiguous declarations cannot be repaired by guessing which URL an ID meant.
+    if any(i["type"] == "duplicate_identity" for i in report["issues"]):
+        raise ResearchReferenceError(report["issues"])
     # Normalize declarations only if identity remains unique. Collisions stay strict errors.
     for group, field in IDENTITIES.items():
         items = data[group]

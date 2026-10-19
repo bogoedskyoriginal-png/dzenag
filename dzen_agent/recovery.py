@@ -26,6 +26,7 @@ def reprocess_research(store, run_id: int, concept_id: int):
         if not run or not concept or run["status"] == "RUNNING":
             raise UserActionRequired("Нужен остановленный запуск и его утверждённая тема.")
         settings, prompts = json.loads(run["settings_json"]), json.loads(run["prompts_json"])
+        prompts = Prompts(store).enrich(prompts)
         if not native(prompts.get("RESEARCH"), "research"):
             raise UserActionRequired("Локальная проверка поддерживает Research 1.0.")
         prefix = f"run:{run_id}" + (f":analysis-v{settings['analysis_revision']}" if settings.get("analysis_revision") else "")
@@ -105,6 +106,7 @@ def reprocess_discovery(store, run_id: int):
         if not run or run["status"] == "RUNNING":
             raise UserActionRequired("Нужен остановленный существующий запуск.")
         settings, prompts = json.loads(run["settings_json"]), json.loads(run["prompts_json"])
+        prompts = Prompts(store).enrich(prompts)
         if not native(prompts.get("DISCOVERY"), "discovery"):
             raise UserActionRequired("Локальная обработка поддерживает Discovery 1.0 из снимка этого запуска.")
         revision = settings.get("analysis_revision", 0)

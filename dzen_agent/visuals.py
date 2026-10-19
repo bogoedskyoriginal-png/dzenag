@@ -10,12 +10,14 @@ import json
 import re
 import socket
 from pathlib import Path
+from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from dzen_agent.editorial_contracts import ImageV1, WriterV1
+from dzen_agent.editorial_contracts import Asset
 from dzen_agent.editorial_pipeline import approved_concept, run_context, validate_run
 from dzen_agent.errors import UserActionRequired
 from dzen_agent.store import dumps, now_iso
@@ -78,8 +80,75 @@ def download_asset(asset, folder: Path):
         asset.download_status = "downloaded"
         # Downloading the file is not visual identification; that happens in a separate vision call.
         asset.authenticity_status = "uncertain"
-        asset.authenticity_basis = "Файл скачан со страницы-источника; визуальная проверка ещё не выполнена."
+        asset.authenticity_basis = "Файл скачан со страницы-источника; визуальная проверка ещё не выполнена. " + asset.authenticity_basis
     return asset
+
+
+def page_image_candidates(urls, *, limit=12, preferred_urls=()):
+    """Extract actual public image URLs; authenticity still requires the separate vision stage."""
+    class Images(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.urls = []
+            self.labels = {}
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            label = " ".join(attrs.get(k, "") for k in ("alt", "class", "id", "src"))
+            if re.search(r"(?:logo|avatar|favicon|sprite|icon|логотип)", label, re.I):
+                return
+            if tag == "img":
+                if any(attrs.get(k, "").isdigit() and int(attrs[k]) < 100 for k in ("width", "height")):
+                    return
+                image = attrs.get("data-src") or attrs.get("src") or ""
+                self.urls.append(image)
+                self.labels[image] = attrs.get("alt") or attrs.get("title") or ""
+            elif tag == "a" and re.search(r"\.(?:jpe?g|png|webp)(?:$|[?#])", attrs.get("href", ""), re.I):
+                self.urls.append(attrs["href"])
+            elif tag == "meta" and attrs.get("property", "").lower() == "og:image":
+                self.urls.append(attrs.get("content", ""))
+    result, seen = [], set()
+    pages = []
+    for page_url in sorted(urls, key=lambda u: (bool(urlsplit(u).query), u not in preferred_urls, u))[:6]:
+        try:
+            parser = Images()
+            raw = fetch_public(page_url, 2 * 1024 * 1024)
+            charset = re.search(br"charset=[\"']?([a-zA-Z0-9_-]+)", raw[:8192])
+            encoding = charset.group(1).decode("ascii") if charset else "utf-8"
+            try:
+                parser.feed(raw.decode(encoding, errors="replace"))
+            except LookupError:
+                parser.feed(raw.decode("utf-8", errors="replace"))
+            def priority(url):
+                caption = parser.labels.get(url, "")
+                if re.search(r"письм|приказ|протокол|переписк|документ|журнал|объявлен|фрагмент.*дела", caption, re.I):
+                    return 2
+                return 0 if re.search(r"кадр|съ[её]м|портрет|photo|still", caption, re.I) else 1
+            images = sorted(dict.fromkeys(parser.urls), key=priority)
+            pages.append((page_url, images, parser.labels))
+        except (ValueError, OSError, httpx.HTTPError):
+            continue
+    # Interleave pages so a long gallery cannot monopolize all candidates.
+    for index in range(limit):
+        for page_url, images, labels in pages:
+            if index >= len(images):
+                continue
+            url = images[index]
+
+            image_url = urljoin(page_url, html.unescape(url))
+            if not url or image_url in seen or urlsplit(image_url).scheme not in ("http", "https"):
+                continue
+            if not re.search(r"\.(?:jpe?g|png|webp)(?:$|[?#])", image_url, re.I):
+                continue
+            seen.add(image_url)
+            result.append(Asset(asset_id="PAGE_" + digest(image_url.encode())[:12], media_type="other",
+                related_work_id=None, related_section_id=None, source_page_url=page_url, source_image_url=image_url,
+                source_name=urlsplit(page_url).hostname or page_url, attribution=None, rights_status="requires_review",
+                authenticity_status="uncertain", authenticity_basis="URL извлечён из HTML страницы; визуальная проверка ещё не выполнена. Описание на странице: " + labels.get(url, "")[:600],
+                local_file_ref=None, file_hash=None, width=None, height=None, download_status="not_attempted",
+                selection_rationale="Кандидат для проверки соответствия готовой статье", issues=[]))
+            if len(result) == limit:
+                return result
+    return result
 
 
 def make_cover(source: Path, text: str, target: Path):
@@ -196,6 +265,10 @@ def prepare_visuals(service, article_id, call_key, *, force=False):
             active = service.store.active_image(article_id)
             if active and Path(active["path"]).is_file() and not validate_visuals(service.store, article_id):
                 return active["id"]
+        from dzen_agent.execution import authorization
+        if (saved_report.cover.status != "ready" and not authorization(service.store, service.run_id)
+                and not any(a.download_status == "failed" for a in saved_report.assets)):
+            raise UserActionRequired("Image: неполное оформление сохранено. Новый подбор требует отдельного разрешения; обычное возобновление не оплачивает новую проверку.")
     model = service.settings.get("visual_model") or service.settings["research_model"]
     catalog = service.settings.get("public_catalog", {}).get("chat", {})
     if catalog and "image" not in catalog.get(model, {}).get("modalities", {}).get("input", []):
@@ -209,10 +282,14 @@ def prepare_visuals(service, article_id, call_key, *, force=False):
         "visual_config": {"cover_width": 1600, "cover_height": 900, "cover_aspect_ratio": "16:9",
             "preferred_image_sources": ["Кинориум", "официальные страницы и пресс-киты"],
             "allowed_image_operations": ["resize", "letterbox", "text_overlay"],
-            "inline_image_policy": "one_per_section_after_cast_block_no_captions"},
+            "cover_source_policy": "Use a verified photo of this production/person, not a scan or an image of another adaptation. HTML captions are source claims to cross-check, not verification.",
+            "inline_image_policy": ("one_per_section_after_cast_block_no_captions"
+                if concept.get("content_format") in ("thematic_selection", "ranked_selection")
+                else "one_per_section_after_paragraph_no_captions; use exact existing Markdown headings and anchors")},
         "publishing_config": {"target_platform": "dzen", "upload_mode": "draft", "publication_permission": False},
-        "tool_capabilities": {"web_image_search": True, "image_inspection": False, "image_download": False,
-            "image_editing": False, "image_upload": False, "article_assembly": False, "dzen_draft_upload": False},
+        "tool_capabilities": {"web_image_search": True, "image_inspection": False, "image_download": True,
+            "image_editing": True, "image_upload": False, "article_assembly": True, "dzen_draft_upload": False},
+        "execution_owner": "Python performs downloads, deterministic cover editing and assembly after your proposal. Propose exact inline placements; do not report these operations as already executed.",
         "execution_phase": "search_candidates_only; files and inspection will be supplied by Python afterwards"}
     report, response = service.structured("IMAGE", ImageV1, context, call_key + ":search", article_id=article_id,
                                           operation="IMAGE_SEARCH")
@@ -221,15 +298,28 @@ def prepare_visuals(service, article_id, call_key, *, force=False):
         raise ValueError("Image изменил концепт.")
     available, inputs = [], []
     urls = citation_urls(response)
+    from dzen_agent.services import paid_search_urls
+    prefix = f"run:{service.run_id}"
+    if service.settings.get("analysis_revision"):
+        prefix += f":analysis-v{service.settings['analysis_revision']}"
+    observed = paid_search_urls(service.store, prefix + f":refresh:{row['id']}:v")
+    verified_research_sources = {str(s["url"]).rstrip("/") for s in research.get("sources", [])} & observed
+    urls |= verified_research_sources
+    if not report.assets:
+        report.assets = page_image_candidates(urls, preferred_urls=verified_research_sources)
+        if report.assets:
+            service.store.log("IMAGE_CANDIDATES", "Прямые URL найдены в HTML подтверждённых страниц; подлинность ещё не проверена", {"article_id":article_id,"asset_ids":[a.asset_id for a in report.assets]})
     if len(report.assets) > 12:
         report.issues.append("За один проход проверяется не более 12 фотографий.")
         report.assets = report.assets[:12]
     for asset in report.assets:
-        if service.store.settings()["stop_requested"]:
-            raise UserActionRequired("Агент остановлен перед скачиванием изображения.")
+        # A model cannot attest execution, including candidates outside the download limit.
         asset.local_file_ref = asset.file_hash = None
         asset.download_status = "not_attempted"
         asset.authenticity_status = "uncertain"
+    for asset in report.assets:
+        if service.store.settings()["stop_requested"]:
+            raise UserActionRequired("Агент остановлен перед скачиванием изображения.")
         try:
             if str(asset.source_page_url).rstrip("/") not in urls:
                 raise ValueError("Страница изображения не подтверждена поисковым ответом.")
@@ -241,6 +331,8 @@ def prepare_visuals(service, article_id, call_key, *, force=False):
             inputs.extend([{"type": "text", "text": "asset_id=" + asset.asset_id},
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()}}])
             available.append(asset)
+            if len(available) == 6:
+                break
         except (ValueError, OSError, httpx.HTTPError) as error:
             asset.download_status = "failed"
             asset.issues.append(str(error))
@@ -248,7 +340,9 @@ def prepare_visuals(service, article_id, call_key, *, force=False):
         context.update(execution_phase="inspect_actual_images_and_propose_cover_and_placements; Python executes file operations",
             tool_results={"assets": [a.model_dump(mode="json") for a in available]})
         context["tool_capabilities"]["image_inspection"] = True
-        reviewed, _ = service.structured("IMAGE", ImageV1, context, call_key + ":inspect", article_id=article_id,
+        inspection_hash = digest(dumps({"assets": [(a.asset_id, a.file_hash, a.authenticity_basis) for a in available],
+            "visual_config": context["visual_config"], "tool_capabilities": context["tool_capabilities"]}).encode())[:16]
+        reviewed, _ = service.structured("IMAGE", ImageV1, context, call_key + ":inspect:" + inspection_hash, article_id=article_id,
             operation="IMAGE_INSPECT", image_inputs=inputs)
         validate_run(reviewed, service)
         if (reviewed.concept_id, reviewed.concept_revision) != (concept["concept_id"], concept["revision"]):
@@ -310,20 +404,24 @@ def prepare_visuals(service, article_id, call_key, *, force=False):
         "ON CONFLICT(call_key) DO UPDATE SET payload_json=excluded.payload_json,created_at=excluded.created_at",
         (article_id, call_key, report.model_dump_json(), now_iso()))
     if not cover_path or report.assembly.status != "ready":
+        from dzen_agent.execution import authorization
+        if authorization(service.store, service.run_id) and report.assembly.status == "partial" and report.assembly.assembled_document_ref:
+            return None  # Honest image gap; QA still validates text and every included image.
         raise UserActionRequired("Image: оформление требует проверки. Текст, источники и отчёт сохранены; "
                                  "повторные платные запросы автоматически не выполняются.")
     return service.attach_image(article_id, str(cover_path.resolve()), model=model,
         prompt_version=service.prompts["IMAGE"]["id"], origin="REAL_PHOTO")
 
 
-def validate_visuals(store, article_id):
+def validate_visuals(store, article_id, *, allow_missing_cover=False):
     article = store.get(article_id)
     row = store.one("SELECT payload_json FROM visual_results WHERE article_id=? ORDER BY id DESC LIMIT 1", (article_id,))
     if not row:
         return ["Нет результата визуальной сборки статьи."]
     report = ImageV1.model_validate_json(row["payload_json"])
     issues = []
-    if report.assembly.status != "ready" or report.cover.status != "ready":
+    optional_cover = allow_missing_cover and report.cover.status == "unavailable" and report.assembly.status == "partial"
+    if not optional_cover and (report.assembly.status != "ready" or report.cover.status != "ready"):
         issues.append("Визуальная сборка или обложка не готова.")
     if report.assembly.original_content_hash != digest(article.body.encode()):
         issues.append("Текст изменился после визуальной сборки. Повторите Image для актуального текста.")
@@ -353,6 +451,8 @@ def validate_visuals(store, article_id):
             if not asset or asset.authenticity_status != "verified" or asset.file_hash != digest(image_path.read_bytes()):
                 issues.append("Иллюстрация не прошла проверку соответствия или файл изменён.")
     cover_path = Path(document["cover_file_ref"]) if document.get("cover_file_ref") else None
+    if optional_cover and not cover_path:
+        return issues
     active = store.active_image(article_id)
     if not active or not cover_path or Path(active["path"]).resolve() != cover_path.resolve():
         issues.append("Активная обложка не совпадает с собранным документом.")
